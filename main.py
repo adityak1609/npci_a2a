@@ -1,0 +1,448 @@
+"""
+main.py — FastAPI application for Mindgate Policy Bot.
+
+Endpoints:
+    POST /auth/admin/login → Authenticate an administrator
+    POST /auth/login       → Legacy role-aware login
+    GET  /health         → Health check
+    POST /ingest         → Trigger PDF ingestion (protected)
+    POST /chat           → Ask a question (protected, with chat memory)
+    POST /chat/stream    → Streaming chat via SSE (protected, with chat memory)
+    GET  /chat/history/{session_id} → Retrieve session message history
+    GET  /               → Serves the frontend chat UI
+"""
+
+import os
+import json
+import time
+import secrets as token_secrets
+import shutil
+import tempfile
+import asyncio
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from urllib.parse import urlparse
+from google import genai
+from google.genai import types
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
+from typing import Optional
+from dotenv import load_dotenv
+from datetime import timezone
+
+from database import (
+    init_db, get_db, User, ChatSession, ChatMessage, MessageFeedback,
+    DocumentChunk, DocumentSummary, AuditLog, A2AIngestionJob, SessionLocal, engine
+)
+from auth import (
+    get_current_user, get_current_admin, authenticate_user_for_role,
+    create_access_token, revoke_token, UserLogin, Token, AUTH_COOKIE_NAME
+)
+from config import configure_logging, env_bool, env_int, request_id_var
+from compliance import ComplianceBlockedError, require_external_ai_approval
+from file_validation import FileValidationError, max_admin_upload_bytes, validate_pdf_bytes
+from rate_limit import check_chat_rate_limit, check_rate_limit
+from retriever import retrieve, retrieve_with_scores, index_exists, invalidate_cache
+from prompt import build_prompt
+from ingest import run_ingestion
+
+from guardrails import (
+    VerifiedStreamBuffer,
+    classifier_circuit_state,
+    check_input,
+    check_output,
+    sanitize_question,
+    _check_regex,
+)
+from routes.a2a_routes import router as a2a_router
+from routes.ws_routes import router as ws_router
+from routes.auth_routes import router as auth_router
+from routes.chat_routes import router as chat_router
+from routes.sys_routes import router as sys_router
+from routes.admin_routes import router as admin_router
+from metrics import inc_counter, observe_histogram, render_prometheus, set_gauge, time_request
+from telemetry import configure_telemetry
+from csrf import csrf_middleware
+from secrets_loader import load_secret_files
+
+configure_logging()
+logger = logging.getLogger(__name__)
+
+def _route_metric_label(request: Request) -> str:
+    route = request.scope.get("route")
+    return getattr(route, "path", None) or "__unmatched__"
+
+
+def _log_internal_error(scope: str, exc: Exception) -> None:
+    logger.exception("Internal error in %s", scope, exc_info=exc)
+
+# ---------------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------------
+load_dotenv()
+load_secret_files()
+
+google_api_key = os.getenv("GOOGLE_API_KEY")
+if not google_api_key:
+    raise EnvironmentError("GOOGLE_API_KEY not set. Create a .env file with your key.")
+
+client = genai.Client(api_key=google_api_key)
+
+# ---------------------------------------------------------------------------
+# FastAPI app with lifespan
+# ---------------------------------------------------------------------------
+_nonce_cleanup_task = None
+EXPECTED_ALEMBIC_REVISION = "20260702_0005_documents"
+
+# ---------------------------------------------------------------------------
+# SQL constants — maintenance queries used by the periodic cleanup task.
+# Keeping them at module level makes them easy to locate and review.
+# ---------------------------------------------------------------------------
+_SQL_DELETE_EXPIRED_NONCES = "DELETE FROM a2a_nonces WHERE expires_at < NOW()"
+_SQL_DELETE_EXPIRED_WS_TICKETS = "DELETE FROM ws_tickets WHERE expires_at < NOW()"
+_SQL_TIMEOUT_STALE_IDEMPOTENCY_KEYS = """
+    UPDATE a2a_idempotency_keys
+    SET status = 'failed',
+        error_code = 'processing_timeout',
+        http_status = 500,
+        updated_at = NOW()
+    WHERE status = 'processing'
+      AND updated_at < NOW() - INTERVAL '30 minutes'
+"""
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    return env_bool(name, default)
+
+
+def _is_production() -> bool:
+    return os.getenv("APP_ENV", "development").strip().lower() == "production"
+
+
+def _env_int(name: str, default: int) -> int:
+    return env_int(name, default)
+
+
+def _is_placeholder(value: str) -> bool:
+    normalized = (value or "").strip().lower()
+    return (
+        not normalized
+        or normalized.startswith("<")
+        or "your-" in normalized
+        or "example.com" in normalized
+    )
+
+
+def _invalid_production_cors_origin(origin: str) -> bool:
+    normalized = (origin or "").strip().lower()
+    parsed = urlparse(normalized)
+    return (
+        not normalized
+        or normalized == "*"
+        or _is_placeholder(normalized)
+        or "localhost" in normalized
+        or "127.0.0.1" in normalized
+        or parsed.scheme != "https"
+        or not parsed.netloc
+    )
+
+
+def _validate_security_config() -> None:
+    """Fail fast when security-critical production settings are unsafe.
+
+    mTLS and JWT-required flags are only enforced in production — in dev/stub
+    mode they may be disabled to allow the local Mock NPCI Agent (plain HTTP)
+    to connect without a certificate.
+    """
+    errors = []
+    is_production = _is_production()
+
+    hmac_secret = os.getenv("A2A_HMAC_SECRET", "")
+    if _is_placeholder(hmac_secret) or len(hmac_secret) < 32:
+        errors.append("A2A_HMAC_SECRET must be a real high-entropy secret of at least 32 characters.")
+
+    npci_key = os.getenv("NPCI_API_KEY", "")
+    if _is_placeholder(npci_key) or len(npci_key) < 24:
+        errors.append("NPCI_API_KEY must be a real secret of at least 24 characters.")
+
+    secret_key = os.getenv("SECRET_KEY", "")
+    if _is_placeholder(secret_key) or len(secret_key) < 32:
+        errors.append("SECRET_KEY must be at least 32 characters.")
+
+    nonce_ttl = _env_int("A2A_NONCE_TTL_SECONDS", 600)
+    if nonce_ttl < 300:
+        errors.append("A2A_NONCE_TTL_SECONDS must be at least 300 seconds to cover timestamp skew.")
+
+    if is_production:
+        if not _env_bool("A2A_MTLS_REQUIRED", default=True):
+            errors.append("A2A_MTLS_REQUIRED must be true in production.")
+        if not _env_bool("A2A_JWT_REQUIRED_EXTERNAL", default=True):
+            errors.append("A2A_JWT_REQUIRED_EXTERNAL must be true in production.")
+        if not _env_bool("AUTH_COOKIE_SECURE", default=False):
+            errors.append("AUTH_COOKIE_SECURE must be true when APP_ENV=production.")
+        if not os.getenv("REDIS_URL", "").strip():
+            errors.append("REDIS_URL must be configured when APP_ENV=production.")
+        if os.getenv("A2A_INGESTION_MODE", "inline").strip().lower() != "worker":
+            errors.append("A2A_INGESTION_MODE must be worker when APP_ENV=production.")
+        if not os.getenv("A2A_CIDR_ALLOWLIST", "").strip():
+            errors.append("A2A_CIDR_ALLOWLIST must be configured when APP_ENV=production.")
+        if not os.getenv("A2A_MTLS_FINGERPRINTS", "").strip():
+            errors.append("A2A_MTLS_FINGERPRINTS must be configured when APP_ENV=production.")
+        if not os.getenv("A2A_MTLS_PARTNER_MAP", "").strip():
+            errors.append("A2A_MTLS_PARTNER_MAP must bind certificate fingerprints to partners in production.")
+        if not os.getenv("A2A_JWT_PARTNER_MAP", "").strip():
+            errors.append("A2A_JWT_PARTNER_MAP must bind JWT subjects to partners in production.")
+        if not os.getenv("A2A_KNOWN_AGENTS", "").strip():
+            errors.append("A2A_KNOWN_AGENTS must be configured when APP_ENV=production.")
+        if not os.getenv("NPCI_AGENT_URL", "").strip():
+            errors.append("NPCI_AGENT_URL must be configured when APP_ENV=production.")
+        if not os.getenv("NPCI_CLIENT_CERT_FILE", "").strip():
+            errors.append("NPCI_CLIENT_CERT_FILE must be configured for outbound NPCI mTLS in production.")
+        if not os.getenv("NPCI_CLIENT_KEY_FILE", "").strip():
+            errors.append("NPCI_CLIENT_KEY_FILE must be configured for outbound NPCI mTLS in production.")
+        cors_origins = [
+            origin.strip().lower()
+            for origin in os.getenv("CORS_ORIGINS", "").split(",")
+            if origin.strip()
+        ]
+        if not cors_origins or any(_invalid_production_cors_origin(origin) for origin in cors_origins):
+            errors.append("CORS_ORIGINS must contain only explicit HTTPS production origins.")
+
+    if errors:
+        raise EnvironmentError("Unsafe security configuration: " + " ".join(errors))
+
+
+def _assert_database_migrated() -> None:
+    """Require Alembic to have applied the expected production schema revision."""
+    from sqlalchemy import text
+
+    db = SessionLocal()
+    try:
+        revision = db.execute(text("SELECT version_num FROM alembic_version")).scalar()
+    except Exception as exc:
+        raise EnvironmentError(
+            "Database is not Alembic-managed. Run `alembic upgrade head` before "
+            "starting with APP_ENV=production."
+        ) from exc
+    finally:
+        db.close()
+
+    if revision != EXPECTED_ALEMBIC_REVISION:
+        raise EnvironmentError(
+            f"Database migration revision mismatch: expected "
+            f"{EXPECTED_ALEMBIC_REVISION}, found {revision or 'none'}. "
+            "Run `alembic upgrade head` before starting production."
+        )
+
+
+def _cleanup_expired_security_rows() -> None:
+    """Delete expired nonce and WebSocket ticket rows."""
+    from sqlalchemy import text
+
+    db = SessionLocal()
+    try:
+        db.execute(text(_SQL_DELETE_EXPIRED_NONCES))
+        db.execute(text(_SQL_DELETE_EXPIRED_WS_TICKETS))
+        db.execute(text(_SQL_TIMEOUT_STALE_IDEMPOTENCY_KEYS))
+        db.commit()
+    finally:
+        db.close()
+
+
+async def _periodic_nonce_cleanup():
+    """Background task to periodically delete expired A2A HMAC nonces."""
+    interval = _env_int("A2A_NONCE_CLEANUP_INTERVAL_SECONDS", 600)
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            await asyncio.to_thread(_cleanup_expired_security_rows)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.exception("Nonce cleanup task error", exc_info=e)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize DB tables, configure threadpool, start file watcher, and recover orphaned jobs."""
+    _validate_security_config()
+    # Increase the default executor so asyncio.to_thread can service many
+    # concurrent blocking calls (Gemini API, DB queries, etc.)
+    loop = asyncio.get_running_loop()
+    # Keep max_workers below DB pool ceiling (pool_size=20 + max_overflow=30 = 50)
+    # to avoid pool-timeout errors when all threads contend for connections.
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=40))
+    if _is_production():
+        _assert_database_migrated()
+    else:
+        init_db()
+    await asyncio.to_thread(_cleanup_expired_security_rows)
+
+
+    # Recover durable received changes before accepting new traffic.
+    from services.a2a_ingestor import recover_orphaned_jobs, recover_received_changes
+    recovered_changes = await recover_received_changes()
+    if recovered_changes:
+        logger.info("Recovered received A2A changes", extra={"recovered": recovered_changes})
+
+    # Recover ingestion jobs orphaned by a previous unclean shutdown.
+    recovered = await recover_orphaned_jobs()
+    if recovered:
+        logger.info("Recovered orphaned ingestion jobs", extra={"recovered": recovered})
+        
+    global _nonce_cleanup_task
+    _nonce_cleanup_task = asyncio.create_task(_periodic_nonce_cleanup())
+
+    yield
+
+    if _nonce_cleanup_task:
+        _nonce_cleanup_task.cancel()
+        try:
+            await asyncio.wait_for(_nonce_cleanup_task, timeout=_env_int("SHUTDOWN_GRACE_SECONDS", 30))
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+
+app = FastAPI(
+    title="Mindgate Policy Bot",
+    description="RAG-based chatbot for querying Mindgate Solutions' internal policies.",
+    version="2.0.0",
+    lifespan=lifespan,
+)
+configure_telemetry(app)
+
+# CORS — use env-configured origins; never wildcard with credentials.
+# Methods and headers are explicit — allow_methods=["*"] is unnecessarily
+# permissive even when origins are restricted.
+_cors_origins_raw = os.getenv("CORS_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000")
+_cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Request-ID"],
+)
+
+app.include_router(a2a_router)
+app.include_router(ws_router)
+app.include_router(auth_router)
+app.include_router(chat_router)
+app.include_router(sys_router)
+app.include_router(admin_router)
+# CSRF protection — Origin/Referer validation on cookie-authenticated mutating
+# routes.  Must be registered AFTER the CORS middleware so preflight OPTIONS
+# requests are handled before CSRF runs.
+app.middleware("http")(csrf_middleware)
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Attach baseline browser security headers to every HTTP response."""
+    request_id = request.headers.get("X-Request-ID") or token_secrets.token_hex(16)
+    request_id_token = request_id_var.set(request_id)
+    csp_nonce = token_secrets.token_urlsafe(16)
+    request.state.csp_nonce = csp_nonce
+    started = time_request()
+    try:
+        if request.url.path in {"/chat", "/chat/stream"}:
+            content_length = request.headers.get("content-length")
+            max_bytes = _env_int("CHAT_MAX_REQUEST_BYTES", 65536)
+            try:
+                body_size = int(content_length) if content_length else 0
+            except ValueError:
+                response = PlainTextResponse("Invalid Content-Length.", status_code=400)
+            else:
+                response = None
+            if response is not None:
+                pass
+            elif body_size > max_bytes:
+                response = PlainTextResponse("Request body too large.", status_code=413)
+            else:
+                response = await call_next(request)
+        else:
+            response = await call_next(request)
+
+        route = _route_metric_label(request)
+        inc_counter("http_requests_total", {
+            "method": request.method,
+            "path": route,
+            "status": response.status_code,
+        })
+        observe_histogram(
+            "http_request_duration_seconds",
+            time_request() - started,
+            labels={"method": request.method, "path": route},
+        )
+        response.headers.setdefault("X-Request-ID", request_id)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=(), payment=()",
+        )
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            f"script-src 'self' 'nonce-{csp_nonce}'; "
+            "script-src-attr 'none'; "
+            f"style-src 'self' 'nonce-{csp_nonce}'; "
+            "style-src-attr 'none'; "
+            "img-src 'self' data:; "
+            "connect-src 'self' ws: wss:; "
+            "frame-ancestors 'none'; "
+            "base-uri 'self'; "
+            "form-action 'self'",
+        )
+        if request.url.scheme == "https":
+            response.headers.setdefault(
+                "Strict-Transport-Security",
+                "max-age=31536000; includeSubDomains",
+            )
+        return response
+    finally:
+        request_id_var.reset(request_id_token)
+
+# Gemini model for chat/generation
+GEMINI_MODEL = "gemini-2.5-flash"
+
+# Transient error codes worth retrying
+_RETRYABLE = ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL"]
+MAX_RETRIES = 2
+
+# Number of past messages to include in context window
+CHAT_MEMORY_SIZE = 5  # Last N user+assistant message PAIRS = 10 messages total
+VERIFIED_STREAM_CHUNK_SIZE = 96
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+frontend_dir = os.path.join(os.path.dirname(__file__), "frontend")
+
+def _frontend_response(request: Request) -> HTMLResponse:
+    csp_nonce = getattr(request.state, "csp_nonce", "")
+    index_path = os.path.join(frontend_dir, "index.html")
+    with open(index_path, "r", encoding="utf-8") as file:
+        html = file.read()
+    html = html.replace("<style>", f'<style nonce="{csp_nonce}">')
+    html = html.replace("<script>", f'<script nonce="{csp_nonce}">')
+    return HTMLResponse(html)
+
+
+@app.get("/", tags=["Frontend"])
+async def serve_frontend(request: Request):
+    """Serve the chat UI at the root URL."""
+    return _frontend_response(request)
+
+
+@app.get("/admin/{path:path}", tags=["Frontend"])
+async def serve_admin_frontend(path: str, request: Request):
+    """Serve the admin SPA for browser navigation paths under /admin."""
+    return _frontend_response(request)

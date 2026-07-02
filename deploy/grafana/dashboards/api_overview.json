@@ -1,0 +1,90 @@
+{
+  "__inputs": [],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0"},
+    {"type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0"}
+  ],
+  "annotations": {"list": []},
+  "description": "Mindgate Policy Bot — API, Auth, Worker, A2A and RAG Observability",
+  "editable": false,
+  "graphTooltip": 1,
+  "id": null,
+  "panels": [
+    {
+      "id": 1,
+      "title": "HTTP Request Rate (req/s)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [{"expr": "sum(rate(http_requests_total[1m])) by (route)", "legendFormat": "{{route}}"}],
+      "fieldConfig": {"defaults": {"unit": "reqps"}}
+    },
+    {
+      "id": 2,
+      "title": "API p95 Latency (s)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [{"expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, route))", "legendFormat": "{{route}} p95"}],
+      "fieldConfig": {"defaults": {"unit": "s", "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.5}, {"color": "red", "value": 2}]}}}
+    },
+    {
+      "id": 3,
+      "title": "Login Failures / 5m",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 8},
+      "targets": [{"expr": "increase(login_failures_total[5m])"}],
+      "options": {"colorMode": "background"},
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 5}, {"color": "red", "value": 20}]}}}
+    },
+    {
+      "id": 4,
+      "title": "A2A Auth Rejections / 5m",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 8},
+      "targets": [{"expr": "increase(a2a_auth_rejections_total[5m])"}],
+      "options": {"colorMode": "background"},
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 3}, {"color": "red", "value": 10}]}}}
+    },
+    {
+      "id": 5,
+      "title": "Rate Limit Hits / 5m",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 8},
+      "targets": [{"expr": "increase(rate_limit_rejections_total[5m])"}],
+      "options": {"colorMode": "background"},
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 10}, {"color": "red", "value": 30}]}}}
+    },
+    {
+      "id": 6,
+      "title": "A2A Confidence Scores",
+      "type": "histogram",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 8},
+      "targets": [{"expr": "a2a_confidence_score_bucket", "legendFormat": "confidence"}]
+    },
+    {
+      "id": 7,
+      "title": "Ingestion Job Status",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "targets": [
+        {"expr": "increase(ingestion_jobs_total{status='success'}[5m])", "legendFormat": "success"},
+        {"expr": "increase(ingestion_jobs_total{status='failed'}[5m])", "legendFormat": "failed"}
+      ]
+    },
+    {
+      "id": 8,
+      "title": "API Target Health",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 12, "x": 12, "y": 12},
+      "targets": [{"expr": "up{job='mindgate-api'}", "legendFormat": "API"}],
+      "options": {"colorMode": "background"},
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "red", "value": 0}, {"color": "green", "value": 1}]}, "mappings": [{"type": "value", "options": {"0": {"text": "DOWN"}, "1": {"text": "UP"}}}]}}
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["mindgate", "policy-bot", "api"],
+  "time": {"from": "now-1h", "to": "now"},
+  "title": "Mindgate Policy Bot — Overview",
+  "uid": "mindgate-overview",
+  "version": 1
+}

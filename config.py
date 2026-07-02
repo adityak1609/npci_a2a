@@ -1,0 +1,79 @@
+"""Shared configuration and logging helpers."""
+
+from __future__ import annotations
+
+import contextvars
+import json
+import logging
+import os
+import sys
+from datetime import datetime, timezone
+
+
+request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id",
+    default="-",
+)
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+class JsonFormatter(logging.Formatter):
+    """Format logs as compact JSON for container log collectors."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "request_id": getattr(record, "request_id", "-"),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id_var.get()
+        return True
+
+
+def configure_logging() -> None:
+    """Configure process-wide structured logging once."""
+    root = logging.getLogger()
+    if getattr(root, "_mindgate_logging_configured", False):
+        return
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    handler.addFilter(RequestIdFilter())
+    root.handlers = [handler]
+    root.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+    root._mindgate_logging_configured = True
+
+
+# ---------------------------------------------------------------------------
+# Global Constants
+# ---------------------------------------------------------------------------
+
+# Gemini model for chat/generation
+GEMINI_MODEL = "gemini-2.5-flash"
+
+# Transient error codes worth retrying
+_RETRYABLE = ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL"]
+MAX_RETRIES = 2
+
+# Number of past messages to include in context window
+CHAT_MEMORY_SIZE = 5  # Last N user+assistant message PAIRS = 10 messages total
+VERIFIED_STREAM_CHUNK_SIZE = 96

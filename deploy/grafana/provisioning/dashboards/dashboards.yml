@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: 'Mindgate Policy Bot'
+    orgId: 1
+    folder: 'Mindgate'
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 10
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards

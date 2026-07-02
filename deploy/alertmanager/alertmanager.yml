@@ -1,0 +1,20 @@
+global:
+  resolve_timeout: 5m
+  smtp_smarthost: "${SMTP_HOST}:${SMTP_PORT}"
+  smtp_from: "${SMTP_USER}"
+  smtp_auth_username: "${SMTP_USER}"
+  smtp_auth_password: "${SMTP_PASS}"
+  smtp_require_tls: true
+
+route:
+  receiver: ops-email
+  group_by: ["alertname", "service"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: ops-email
+    email_configs:
+      - to: "${A2A_NOTIFY_LIST}"
+        send_resolved: true

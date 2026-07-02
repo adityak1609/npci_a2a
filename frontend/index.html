@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mindgate Policy Bot</title>
+    <style>
+        :root {
+            --bg: #eef2f5;
+            --surface: #ffffff;
+            --surface-2: #f7f9fb;
+            --rail: #101820;
+            --rail-2: #18232d;
+            --line: #d9e0e7;
+            --line-strong: #c3ced8;
+            --text: #17202a;
+            --muted: #607080;
+            --accent: #0f766e;
+            --accent-2: #2563eb;
+            --amber: #b7791f;
+            --green: #168047;
+            --danger: #c2413a;
+            --purple: #7157c7;
+            --shadow: 0 18px 42px rgba(20, 31, 43, .14);
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background: var(--bg);
+            color: var(--text);
+        }
+        button, input, textarea { font: inherit; }
+        button { cursor: pointer; }
+        h1, h2, h3, p { margin: 0; }
+        .hidden { display: none !important; }
+        .brand-mark svg, .icon svg {
+            width: 20px;
+            height: 20px;
+            fill: none;
+            stroke: currentColor;
+            stroke-width: 2;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+        }
+        #auth-screen {
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            padding: 24px;
+            background:
+                linear-gradient(90deg, rgba(16, 24, 32, .92), rgba(16, 24, 32, .55)),
+                url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='900' height='620' viewBox='0 0 900 620'%3E%3Crect width='900' height='620' fill='%23eef2f5'/%3E%3Cg fill='none' stroke='%23c7d2dc' stroke-width='2'%3E%3Cpath d='M80 98h740v424H80z'/%3E%3Cpath d='M80 158h740M230 158v364M392 158v364M554 158v364M716 158v364'/%3E%3Cpath d='M130 218h670M130 278h670M130 338h670M130 398h670M130 458h670'/%3E%3C/g%3E%3Cg fill='%230f766e' fill-opacity='.14'%3E%3Crect x='112' y='188' width='86' height='34' rx='4'/%3E%3Crect x='422' y='308' width='94' height='34' rx='4'/%3E%3Crect x='744' y='428' width='54' height='34' rx='4'/%3E%3C/g%3E%3C/svg%3E");
+            background-size: cover;
+            background-position: center;
+        }
+        .auth-card {
+            width: min(430px, 100%);
+            background: rgba(255, 255, 255, .96);
+            border: 1px solid rgba(255, 255, 255, .65);
+            border-radius: 8px;
+            box-shadow: var(--shadow);
+            padding: 30px;
+        }
+        .brand-mark {
+            width: 44px;
+            height: 44px;
+            border-radius: 8px;
+            display: grid;
+            place-items: center;
+            color: #ffffff;
+            background: var(--accent);
+            margin-bottom: 18px;
+        }
+        .auth-card h1 { font-size: 24px; margin-bottom: 6px; letter-spacing: 0; }
+        .auth-card p { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+        label { display: block; color: var(--muted); font-size: 12px; font-weight: 650; margin: 15px 0 6px; }
+        input, textarea {
+            width: 100%;
+            color: var(--text);
+            background: #ffffff;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            padding: 11px 12px;
+            outline: none;
+        }
+        input:focus, textarea:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(15, 118, 110, .12);
+        }
+        .primary-btn, .ghost-btn, .danger-btn, .icon-btn {
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            color: var(--text);
+            background: #ffffff;
+            min-height: 36px;
+            padding: 0 12px;
+            font-weight: 650;
+        }
+        .primary-btn { background: var(--accent); border-color: var(--accent); color: #ffffff; }
+        .ghost-btn:hover, .icon-btn:hover { border-color: var(--line-strong); background: var(--surface-2); }
+        .danger-btn { color: var(--danger); border-color: rgba(194, 65, 58, .35); background: #fff5f4; }
+        .icon-btn { width: 36px; padding: 0; display: inline-grid; place-items: center; }
+        .full-width { width: 100%; }
+        .mt-12 { margin-top: 12px; }
+        .error { color: var(--danger); font-size: 12px; min-height: 18px; margin-top: 10px; }
+        #app {
+            min-height: 100vh;
+            display: grid;
+            grid-template-columns: 232px minmax(0, 1fr);
+            grid-template-rows: 64px minmax(0, 1fr);
+        }
+        #app::before {
+            content: "Mindgate Agent Console";
+            grid-column: 2;
+            grid-row: 1;
+            display: flex;
+            align-items: center;
+            padding: 0 28px;
+            border-bottom: 1px solid var(--line);
+            background: rgba(255, 255, 255, .84);
+            color: var(--muted);
+            font-size: 13px;
+            font-weight: 750;
+        }
+        aside {
+            grid-row: 1 / span 2;
+            background: var(--rail);
+            color: #dbe6ef;
+            border-right: 1px solid rgba(255, 255, 255, .08);
+            display: flex;
+            flex-direction: column;
+            min-height: 100vh;
+        }
+        .side-head { padding: 18px 16px; border-bottom: 1px solid rgba(255, 255, 255, .09); }
+        .side-brand { display: flex; gap: 12px; align-items: center; }
+        .side-brand-mark { margin: 0; width: 38px; height: 38px; background: #19a79b; }
+        .side-brand h2 { font-size: 14px; color: #ffffff; }
+        .side-brand span { color: #95a6b7; font-size: 12px; }
+        nav { padding: 12px; display: grid; gap: 6px; }
+        .nav-btn {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            color: #aebccc;
+            background: transparent;
+            border: 1px solid transparent;
+            border-radius: 6px;
+            padding: 10px;
+            text-align: left;
+            min-height: 42px;
+        }
+        .nav-btn.active, .nav-btn:hover {
+            color: #ffffff;
+            background: var(--rail-2);
+            border-color: rgba(255, 255, 255, .08);
+        }
+        .side-foot { margin-top: auto; padding: 14px; border-top: 1px solid rgba(255, 255, 255, .09); }
+        .admin-name { color: #9babb9; font-size: 12px; margin-bottom: 10px; overflow: hidden; text-overflow: ellipsis; }
+        main {
+            grid-column: 2;
+            grid-row: 2;
+            min-width: 0;
+            padding: 24px 28px;
+            overflow: auto;
+            height: calc(100vh - 64px);
+        }
+        .section { display: none; min-height: 100%; }
+        .section.active { display: block; }
+        .section-head {
+            display: flex;
+            align-items: flex-end;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+        .section-head h1 { font-size: 26px; letter-spacing: 0; }
+        .section-head p { color: var(--muted); font-size: 13px; margin-top: 4px; }
+        .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .upload-box, .card, .sessions, .chat-shell, .slide-panel {
+            background: var(--surface);
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            box-shadow: 0 1px 2px rgba(20, 31, 43, .05);
+        }
+        .upload-box {
+            padding: 14px;
+            margin-bottom: 16px;
+            display: grid;
+            gap: 10px;
+            border-left: 4px solid var(--accent);
+        }
+        .upload-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+        .card { padding: 14px; }
+        .card-title { font-weight: 750; overflow-wrap: anywhere; line-height: 1.35; }
+        .meta { color: var(--muted); font-size: 12px; margin-top: 7px; line-height: 1.45; }
+        .card-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            min-height: 22px;
+            padding: 0 8px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 800;
+            border: 1px solid transparent;
+            vertical-align: middle;
+        }
+        .badge.teal { color: #075e56; background: #ddf7f4; border-color: #a9e3dc; }
+        .badge.gray { color: #506070; background: #edf1f5; border-color: #d6dee6; }
+        .badge.purple { color: #563aa5; background: #eee9ff; border-color: #d8ccff; }
+        .badge.amber { color: #8a5a12; background: #fff3d8; border-color: #f4d08d; }
+        .badge.green { color: #12643a; background: #ddf7e9; border-color: #aae0c3; }
+        .chat-layout { height: calc(100vh - 136px); display: grid; grid-template-columns: 286px minmax(0, 1fr); gap: 14px; }
+        .sessions { display: flex; flex-direction: column; min-height: 0; }
+        .sessions-head {
+            padding: 12px;
+            border-bottom: 1px solid var(--line);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: var(--surface-2);
+            border-radius: 8px 8px 0 0;
+        }
+        #session-list { overflow: auto; padding: 8px; display: grid; gap: 6px; }
+        .session-item {
+            text-align: left;
+            background: transparent;
+            border: 1px solid transparent;
+            color: var(--text);
+            border-radius: 6px;
+            padding: 10px;
+        }
+        .session-item.active, .session-item:hover { background: #eef8f7; border-color: #bfe4df; }
+        .session-preview { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
+        .chat-shell { display: grid; grid-template-rows: minmax(0, 1fr) auto; min-width: 0; min-height: 0; }
+        #messages { overflow: auto; padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+        .msg { display: flex; }
+        .msg.user { justify-content: flex-end; }
+        .bubble {
+            max-width: min(760px, 84%);
+            padding: 11px 13px;
+            border-radius: 8px;
+            white-space: pre-wrap;
+            line-height: 1.48;
+            overflow-wrap: anywhere;
+        }
+        .msg.user .bubble { background: var(--accent); color: #ffffff; }
+        .msg.bot .bubble { background: var(--surface-2); border: 1px solid var(--line); }
+        .chat-input { border-top: 1px solid var(--line); padding: 12px; background: var(--surface); border-radius: 0 0 8px 8px; }
+        .chat-input-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: end; }
+        .chat-input textarea { min-height: 46px; max-height: 130px; resize: none; }
+        .low-confidence {
+            margin-top: 10px;
+            padding: 10px;
+            border: 1px solid #f1cf8d;
+            background: #fff7e6;
+            border-radius: 6px;
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            align-items: center;
+            color: #7b5112;
+            font-size: 13px;
+        }
+        .ticket-badge {
+            align-self: flex-start;
+            border: 1px solid #f1cf8d;
+            background: #fff7e6;
+            color: #7b5112;
+            border-radius: 6px;
+            padding: 9px 11px;
+            font-size: 13px;
+        }
+        .inbox-layout { position: relative; min-height: calc(100vh - 150px); }
+        .tabs {
+            display: inline-flex;
+            gap: 4px;
+            margin-bottom: 14px;
+            padding: 4px;
+            background: #e4ebf1;
+            border-radius: 8px;
+        }
+        .tab-btn { border-color: transparent; background: transparent; }
+        .tab-btn.active { background: #ffffff; border-color: var(--line); color: var(--text); box-shadow: 0 1px 2px rgba(20,31,43,.06); }
+        .tab-panel { display: none; }
+        .tab-panel.active { display: block; }
+        .slide-panel {
+            position: fixed;
+            top: 0;
+            right: 0;
+            width: min(520px, 92vw);
+            height: 100vh;
+            z-index: 10;
+            box-shadow: var(--shadow);
+            padding: 20px;
+            transform: translateX(110%);
+            transition: transform .18s ease;
+            overflow: auto;
+        }
+        .slide-panel.open { transform: translateX(0); }
+        .slide-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 14px; }
+        .summary-body, .answer-body { color: #2a3642; white-space: pre-wrap; line-height: 1.55; font-size: 14px; }
+        .toast {
+            position: fixed;
+            right: 18px;
+            bottom: 18px;
+            padding: 11px 13px;
+            border-radius: 6px;
+            background: #17202a;
+            border: 1px solid rgba(255,255,255,.12);
+            color: #ffffff;
+            box-shadow: var(--shadow);
+            opacity: 0;
+            transform: translateY(10px);
+            transition: .18s ease;
+            pointer-events: none;
+            z-index: 20;
+        }
+        .toast.visible { opacity: 1; transform: translateY(0); }
+        .empty {
+            color: var(--muted);
+            padding: 18px;
+            border: 1px dashed var(--line-strong);
+            border-radius: 8px;
+            text-align: center;
+            background: rgba(255,255,255,.5);
+        }
+        @media (max-width: 900px) {
+            #app { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+            #app::before { display: none; }
+            aside { grid-row: 1; min-height: auto; }
+            nav { grid-template-columns: repeat(3, 1fr); }
+            .side-foot { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; }
+            .admin-name { margin: 0; }
+            main { grid-column: 1; grid-row: 2; height: auto; min-height: calc(100vh - 180px); padding: 16px; }
+            .chat-layout { height: auto; min-height: calc(100vh - 230px); grid-template-columns: 1fr; }
+            .sessions { max-height: 220px; }
+        }
+        @media (max-width: 560px) {
+            nav { grid-template-columns: 1fr; }
+            .section-head, .low-confidence { align-items: stretch; flex-direction: column; }
+            .upload-row, .chat-input-row { grid-template-columns: 1fr; }
+            .grid { grid-template-columns: 1fr; }
+            .bubble { max-width: 94%; }
+        }
+    </style>
+</head>
+<body>
+<section id="auth-screen">
+    <form class="auth-card" id="admin-login-form">
+        <div class="brand-mark icon"><svg viewBox="0 0 24 24"><path d="M12 2 4 6v6c0 5 3.4 9.4 8 10 4.6-.6 8-5 8-10V6l-8-4Z"/><path d="m9 12 2 2 4-4"/></svg></div>
+        <h1>Mindgate Policy Bot</h1>
+        <p>Administrator workspace</p>
+        <label for="admin-email">Email</label>
+        <input id="admin-email" type="email" autocomplete="username" required>
+        <label for="admin-password">Password</label>
+        <input id="admin-password" type="password" autocomplete="current-password" required>
+        <div class="error" id="login-error"></div>
+        <button class="primary-btn full-width mt-12" type="submit">Sign in</button>
+    </form>
+</section>
+
+<section id="app" class="hidden">
+    <aside>
+        <div class="side-head">
+            <div class="side-brand">
+                <div class="brand-mark icon side-brand-mark"><svg viewBox="0 0 24 24"><path d="M12 2 4 6v6c0 5 3.4 9.4 8 10 4.6-.6 8-5 8-10V6l-8-4Z"/><path d="m9 12 2 2 4-4"/></svg></div>
+                <div><h2>Mindgate Policy Bot</h2><span>Operations workspace</span></div>
+            </div>
+        </div>
+        <nav>
+            <button class="nav-btn active" data-section="documents"><span class="icon"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg></span>Documents</button>
+            <button class="nav-btn" data-section="chat"><span class="icon"><svg viewBox="0 0 24 24"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/></svg></span>Chat</button>
+            <button class="nav-btn" data-section="inbox"><span class="icon"><svg viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5h13L22 12v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z"/></svg></span>Inbox</button>
+        </nav>
+        <div class="side-foot">
+            <div class="admin-name" id="admin-name"></div>
+            <button class="ghost-btn full-width" id="logout-btn">Sign out</button>
+        </div>
+    </aside>
+
+    <main>
+        <section class="section active" id="section-documents">
+            <div class="section-head">
+                <div><h1>Documents</h1><p>Indexed policy files and admin uploads.</p></div>
+                <button class="ghost-btn" id="refresh-pdfs">Refresh</button>
+            </div>
+            <div class="upload-box">
+                <div class="upload-row">
+                    <input id="pdf-file" type="file" accept=".pdf,application/pdf">
+                    <button class="primary-btn" id="upload-btn">Upload</button>
+                </div>
+                <div class="meta" id="upload-status"></div>
+            </div>
+            <div class="grid" id="pdf-grid"></div>
+        </section>
+
+        <section class="section" id="section-chat">
+            <div class="chat-layout">
+                <div class="sessions">
+                    <div class="sessions-head">
+                        <strong>Sessions</strong>
+                        <button class="icon-btn icon" id="new-chat" title="New chat"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
+                    </div>
+                    <div id="session-list"></div>
+                </div>
+                <div class="chat-shell">
+                    <div id="messages"></div>
+                    <div class="chat-input">
+                        <div class="chat-input-row">
+                            <textarea id="chat-input" rows="1" placeholder="Ask the knowledge base"></textarea>
+                            <button class="primary-btn icon" id="send-chat" title="Send"><svg viewBox="0 0 24 24"><path d="M22 2 11 13"/><path d="m22 2-7 20-4-9-9-4 20-7Z"/></svg></button>
+                        </div>
+                        <div id="low-confidence" class="low-confidence hidden">
+                            <span>Couldn't find a confident answer. Raise this to NPCI?</span>
+                            <span class="toolbar">
+                                <button class="primary-btn" id="raise-npci">Raise to NPCI</button>
+                                <button class="ghost-btn" id="dismiss-low-confidence">Dismiss</button>
+                            </span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="section" id="section-inbox">
+            <div class="section-head">
+                <div><h1>Inbox</h1><p>Received A2A documents and NPCI ticket activity.</p></div>
+                <button class="ghost-btn" id="refresh-inbox">Refresh</button>
+            </div>
+            <div class="inbox-layout">
+                <div class="tabs">
+                    <button class="ghost-btn tab-btn active" data-tab="docs">Received Documents</button>
+                    <button class="ghost-btn tab-btn" data-tab="tickets">NPCI Tickets</button>
+                </div>
+                <div class="tab-panel active" id="tab-docs"><div class="grid" id="summary-grid"></div></div>
+                <div class="tab-panel" id="tab-tickets"><div class="grid" id="ticket-grid"></div></div>
+            </div>
+        </section>
+    </main>
+</section>
+
+<aside class="slide-panel" id="summary-panel">
+    <div class="slide-head">
+        <h2 id="summary-title">Summary</h2>
+        <button class="icon-btn" id="close-summary" title="Close">X</button>
+    </div>
+    <div class="summary-body" id="summary-body"></div>
+</aside>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const EMAIL_KEY = 'mg_email';
+const SESSION_KEY = 'mg_session_id';
+let email = sessionStorage.getItem(EMAIL_KEY) || '';
+let sessionId = localStorage.getItem(SESSION_KEY) || crypto.randomUUID();
+let lastLowConfidenceQuery = '';
+let pendingBadges = {};
+let activeSocket = null;
+
+localStorage.setItem(SESSION_KEY, sessionId);
+
+const $ = id => document.getElementById(id);
+const authHeaders = () => ({ 'Content-Type': 'application/json' });
+const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+const formatDate = value => value ? new Date(value).toLocaleString() : '';
+const short = (value, len = 120) => value && value.length > len ? value.slice(0, len) + '...' : (value || '');
+
+function showToast(message) {
+    const toast = $('toast');
+    toast.textContent = message;
+    toast.classList.add('visible');
+    clearTimeout(showToast.timer);
+    showToast.timer = setTimeout(() => toast.classList.remove('visible'), 3500);
+}
+
+function showApp() {
+    $('auth-screen').classList.add('hidden');
+    $('app').classList.remove('hidden');
+    $('admin-name').textContent = email;
+    switchSection(location.pathname.includes('/admin/chat') ? 'chat' : location.pathname.includes('/admin/inbox') ? 'inbox' : 'documents');
+    loadPdfs();
+    loadSessions();
+}
+
+async function signOut() {
+    await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin' }).catch(() => {});
+    email = '';
+    sessionStorage.removeItem(EMAIL_KEY);
+    $('app').classList.add('hidden');
+    $('auth-screen').classList.remove('hidden');
+    history.replaceState(null, '', '/');
+}
+
+$('admin-login-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    $('login-error').textContent = '';
+    try {
+        const res = await fetch('/auth/admin/login', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: $('admin-email').value.trim(), password: $('admin-password').value }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || 'Login failed');
+        email = data.user_email;
+        sessionStorage.setItem(EMAIL_KEY, email);
+        history.replaceState(null, '', '/admin/documents');
+        showApp();
+    } catch (err) {
+        $('login-error').textContent = err.message;
+    }
+});
+
+$('logout-btn').addEventListener('click', signOut);
+
+document.querySelectorAll('.nav-btn').forEach(btn => {
+    btn.addEventListener('click', () => switchSection(btn.dataset.section));
+});
+
+function switchSection(section) {
+    document.querySelectorAll('.nav-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.section === section));
+    document.querySelectorAll('.section').forEach(panel => panel.classList.toggle('active', panel.id === `section-${section}`));
+    history.replaceState(null, '', `/admin/${section === 'chat' ? 'chat' : section === 'inbox' ? 'inbox' : 'documents'}`);
+    if (section === 'documents') loadPdfs();
+    if (section === 'chat') { loadSessions(); loadHistory(); }
+    if (section === 'inbox') loadInbox();
+}
+
+async function checkedFetch(url, options = {}) {
+    const res = await fetch(url, { credentials: 'same-origin', ...options });
+    if (res.status === 401 || res.status === 403) {
+        signOut();
+        throw new Error('Session expired.');
+    }
+    return res;
+}
+
+async function loadPdfs() {
+    const grid = $('pdf-grid');
+    grid.innerHTML = '<div class="empty">Loading...</div>';
+    try {
+        const res = await checkedFetch('/admin/pdfs', { headers: authHeaders() });
+        const data = await res.json();
+        const pdfs = data.pdfs || [];
+        grid.innerHTML = pdfs.length ? pdfs.map(pdf => `
+            <article class="card">
+                <div class="card-title">${escapeHtml(pdf.filename)}</div>
+                <div class="meta">${pdf.chunk_count} chunks${pdf.last_modified ? ' · ' + formatDate(pdf.last_modified) : ''}</div>
+                <div class="card-actions">
+                    <button class="danger-btn" data-action="delete-pdf" data-filename="${escapeHtml(encodeURIComponent(pdf.filename))}">Delete</button>
+                </div>
+            </article>
+        `).join('') : '<div class="empty">No PDFs indexed.</div>';
+    } catch (err) {
+        grid.innerHTML = `<div class="empty">${escapeHtml(err.message)}</div>`;
+    }
+}
+
+$('refresh-pdfs').addEventListener('click', loadPdfs);
+$('pdf-grid').addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-action="delete-pdf"]');
+    if (!button) return;
+    deletePdf(button.dataset.filename);
+});
+$('upload-btn').addEventListener('click', async () => {
+    const file = $('pdf-file').files[0];
+    if (!file) return;
+    const body = new FormData();
+    body.append('file', file);
+    $('upload-status').textContent = 'Uploading...';
+    try {
+        const res = await checkedFetch('/admin/upload', { method: 'POST', body });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || 'Upload failed');
+        $('pdf-file').value = '';
+        $('upload-status').textContent = 'Upload complete.';
+        loadPdfs();
+    } catch (err) {
+        $('upload-status').textContent = err.message;
+    }
+});
+
+async function deletePdf(encodedName) {
+    const filename = decodeURIComponent(encodedName);
+    if (!confirm(`Delete ${filename}?`)) return;
+    const res = await checkedFetch(`/admin/pdfs/${encodedName}`, { method: 'DELETE', headers: authHeaders() });
+    if (!res.ok) showToast('Delete failed');
+    loadPdfs();
+}
+
+function appendMessage(role, text) {
+    const wrap = document.createElement('div');
+    wrap.className = `msg ${role}`;
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.textContent = text;
+    wrap.appendChild(bubble);
+    $('messages').appendChild(wrap);
+    $('messages').scrollTop = $('messages').scrollHeight;
+    return bubble;
+}
+
+function appendTicketBadge(ticketId) {
+    const badge = document.createElement('div');
+    badge.className = 'ticket-badge';
+    badge.textContent = `Query raised - Ticket #${ticketId} · Awaiting NPCI response`;
+    $('messages').appendChild(badge);
+    pendingBadges[ticketId] = badge;
+    $('messages').scrollTop = $('messages').scrollHeight;
+}
+
+$('new-chat').addEventListener('click', () => {
+    sessionId = crypto.randomUUID();
+    localStorage.setItem(SESSION_KEY, sessionId);
+    $('messages').innerHTML = '';
+    loadSessions();
+});
+
+$('chat-input').addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        sendChat();
+    }
+});
+$('send-chat').addEventListener('click', sendChat);
+
+async function sendChat() {
+    const question = $('chat-input').value.trim();
+    if (!question) return;
+    $('low-confidence').classList.add('hidden');
+    appendMessage('user', question);
+    $('chat-input').value = '';
+    const bubble = appendMessage('bot', '');
+    let text = '';
+    let doneSeen = false;
+    try {
+        const res = await checkedFetch('/chat/stream', {
+            method: 'POST',
+            headers: authHeaders(),
+            body: JSON.stringify({ question, session_id: sessionId }),
+        });
+        if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.detail || 'Chat failed');
+        }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const events = buffer.split(/\r?\n\r?\n/);
+            buffer = events.pop();
+            for (const eventText of events) {
+                const payload = eventText.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
+                if (!payload) continue;
+                const data = JSON.parse(payload);
+                if (data.type === 'low_confidence') {
+                    bubble.remove();
+                    lastLowConfidenceQuery = question;
+                    $('low-confidence').classList.remove('hidden');
+                    return;
+                }
+                if (data.error) throw new Error(data.error);
+                if (data.token) {
+                    text += data.token;
+                    bubble.textContent = text;
+                    $('messages').scrollTop = $('messages').scrollHeight;
+                }
+                if (data.done) doneSeen = true;
+            }
+        }
+        if (!doneSeen && !text) bubble.textContent = 'No response received.';
+        loadSessions();
+    } catch (err) {
+        bubble.textContent = `Error: ${err.message}`;
+    }
+}
+
+async function loadSessions() {
+    try {
+        const res = await checkedFetch('/chat/sessions', { headers: authHeaders() });
+        const data = await res.json();
+        const sessions = data.sessions || [];
+        $('session-list').innerHTML = sessions.length ? sessions.map(item => `
+            <button class="session-item ${item.session_id === sessionId ? 'active' : ''}" data-session-id="${escapeHtml(item.session_id)}">
+                <div class="session-preview">${escapeHtml(item.preview)}</div>
+                <div class="meta">${formatDate(item.created_at)} · ${item.message_count} msgs</div>
+            </button>
+        `).join('') : '<div class="empty">No conversations.</div>';
+    } catch (_) {}
+}
+
+$('session-list').addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-session-id]');
+    if (!button) return;
+    openSession(button.dataset.sessionId);
+});
+
+async function openSession(id) {
+    sessionId = id;
+    localStorage.setItem(SESSION_KEY, sessionId);
+    await loadHistory();
+    loadSessions();
+}
+
+async function loadHistory() {
+    try {
+        const res = await checkedFetch(`/chat/history/${sessionId}`, { headers: authHeaders() });
+        if (!res.ok) return;
+        const data = await res.json();
+        $('messages').innerHTML = '';
+        (data.messages || []).forEach(msg => appendMessage(msg.role === 'user' ? 'user' : 'bot', msg.content));
+    } catch (_) {}
+}
+
+$('dismiss-low-confidence').addEventListener('click', () => $('low-confidence').classList.add('hidden'));
+$('raise-npci').addEventListener('click', async () => {
+    if (!lastLowConfidenceQuery) return;
+    try {
+        const res = await checkedFetch('/a2a/internal', {
+            method: 'POST',
+            headers: authHeaders(),
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: crypto.randomUUID(),
+                method: 'agent.escalate_to_npci',
+                params: { query: lastLowConfidenceQuery, session_id: sessionId, context: {} },
+            }),
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error.message);
+        const ticketId = data.result.ticket_id;
+        $('low-confidence').classList.add('hidden');
+        appendTicketBadge(ticketId);
+        watchTicket(ticketId);
+        loadInbox();
+    } catch (err) {
+        showToast(err.message);
+    }
+});
+
+async function issueWsTicket(ticketId) {
+    const res = await checkedFetch(`/ws/tickets/${encodeURIComponent(ticketId)}`, {
+        method: 'POST',
+        headers: authHeaders(),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || 'Could not create WebSocket ticket');
+    return data.ticket;
+}
+
+async function watchTicket(ticketId) {
+    if (activeSocket) activeSocket.close();
+    try {
+        const wsTicket = await issueWsTicket(ticketId);
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        activeSocket = new WebSocket(`${protocol}//${location.host}/ws/${encodeURIComponent(ticketId)}?ticket=${encodeURIComponent(wsTicket)}`);
+        activeSocket.onmessage = event => {
+            const data = JSON.parse(event.data);
+            if (data.event === 'npci_reply') {
+                const badge = pendingBadges[data.ticket_id];
+                if (badge) badge.remove();
+                appendMessage('bot', data.answer);
+                showToast('NPCI answer added to the knowledge base.');
+                activeSocket.close();
+                loadInbox();
+            }
+        };
+    } catch (err) {
+        showToast(err.message);
+    }
+}
+
+document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        document.querySelectorAll('.tab-btn').forEach(item => item.classList.toggle('active', item === btn));
+        document.querySelectorAll('.tab-panel').forEach(panel => panel.classList.toggle('active', panel.id === `tab-${btn.dataset.tab}`));
+        loadInbox();
+    });
+});
+$('refresh-inbox').addEventListener('click', loadInbox);
+
+async function loadInbox() {
+    await Promise.all([loadSummaries(), loadTickets()]);
+}
+
+function sourceBadge(source) {
+    const cls = source === 'npci_agent' ? 'teal' : source === 'npci_official' ? 'purple' : 'gray';
+    return `<span class="badge ${cls}">${escapeHtml(source)}</span>`;
+}
+
+function statusBadge(status) {
+    const cls = status === 'ready' ? 'green' : status === 'failed' ? 'amber' : status === 'processing' || status === 'extracting' || status === 'embedding' ? 'teal' : 'gray';
+    return `<span class="badge ${cls}">${escapeHtml(status || 'queued')}</span>`;
+}
+
+async function loadSummaries() {
+    const grid = $('summary-grid');
+    grid.innerHTML = '<div class="empty">Loading...</div>';
+    try {
+        const res = await checkedFetch('/documents', { headers: authHeaders() });
+        const docs = await res.json();
+        grid.innerHTML = docs.length ? docs.map(doc => `
+            <article class="card">
+                <div class="card-title">${escapeHtml(doc.filename)}</div>
+                <div class="meta">${sourceBadge(doc.source)} ${statusBadge(doc.status)} · ${formatDate(doc.created_at)}</div>
+                ${doc.summary ? `<div class="meta">${escapeHtml(short(doc.summary, 150))}</div>` : ''}
+                ${doc.job_error ? `<div class="meta">${escapeHtml(short(doc.job_error, 160))}</div>` : ''}
+                <div class="card-actions">
+                    ${doc.status === 'ready' ? `<button class="ghost-btn" data-action="view-summary" data-document-id="${doc.document_id}" data-filename="${escapeHtml(encodeURIComponent(doc.filename))}">View Summary</button>` : ''}
+                    <button class="ghost-btn" data-action="ask-about" data-filename="${escapeHtml(encodeURIComponent(doc.filename))}">Ask about this</button>
+                    ${doc.status === 'failed' && doc.job_id ? `<button class="ghost-btn" data-action="retry-ingestion" data-job-id="${doc.job_id}">Retry</button>` : ''}
+                </div>
+            </article>
+        `).join('') : '<div class="empty">No received documents.</div>';
+    } catch (err) {
+        grid.innerHTML = `<div class="empty">${escapeHtml(err.message)}</div>`;
+    }
+}
+
+$('summary-grid').addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-action]');
+    if (!button) return;
+    if (button.dataset.action === 'view-summary') {
+        viewSummary(Number(button.dataset.documentId), button.dataset.filename);
+    } else if (button.dataset.action === 'ask-about') {
+        askAbout(button.dataset.filename);
+    } else if (button.dataset.action === 'retry-ingestion') {
+        retryIngestion(Number(button.dataset.jobId));
+    }
+});
+
+async function viewSummary(documentId, encodedFilename) {
+    const filename = decodeURIComponent(encodedFilename);
+    const res = await checkedFetch('/a2a/internal', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: crypto.randomUUID(),
+            method: 'agent.get_summary',
+            params: { document_id: documentId, filename },
+        }),
+    });
+    const data = await res.json();
+    if (data.error) {
+        showToast(data.error.message);
+        return;
+    }
+    $('summary-title').textContent = data.result.filename;
+    $('summary-body').textContent = data.result.summary;
+    $('summary-panel').classList.add('open');
+}
+
+async function retryIngestion(jobId) {
+    try {
+        const res = await checkedFetch(`/ingestion-jobs/${jobId}/retry`, {
+            method: 'POST',
+            headers: authHeaders(),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || 'Retry failed');
+        showToast('Ingestion retry queued.');
+        loadInbox();
+    } catch (err) {
+        showToast(err.message);
+    }
+}
+
+$('close-summary').addEventListener('click', () => $('summary-panel').classList.remove('open'));
+
+function askAbout(encodedFilename) {
+    const filename = decodeURIComponent(encodedFilename);
+    switchSection('chat');
+    $('chat-input').value = `Tell me about ${filename}`;
+    $('chat-input').focus();
+}
+
+async function loadTickets() {
+    const grid = $('ticket-grid');
+    grid.innerHTML = '<div class="empty">Loading...</div>';
+    try {
+        const res = await checkedFetch('/npci-tickets', { headers: authHeaders() });
+        const tickets = await res.json();
+        grid.innerHTML = tickets.length ? tickets.map(ticket => `
+            <article class="card">
+                <div class="card-title">${escapeHtml(short(ticket.query))}</div>
+                <div class="meta">
+                    <span class="badge ${ticket.status === 'resolved' ? 'green' : 'amber'}">${escapeHtml(ticket.status)}</span>
+                    · ${escapeHtml(ticket.ticket_id)} · ${formatDate(ticket.created_at)}
+                </div>
+                ${ticket.status === 'resolved' ? `<details class="card-actions"><summary>View Answer</summary><div class="answer-body">${escapeHtml(ticket.answer)}</div></details>` : ''}
+            </article>
+        `).join('') : '<div class="empty">No NPCI tickets.</div>';
+    } catch (err) {
+        grid.innerHTML = `<div class="empty">${escapeHtml(err.message)}</div>`;
+    }
+}
+
+async function restoreSession() {
+    try {
+        const res = await fetch('/auth/me', { credentials: 'same-origin' });
+        if (!res.ok) return;
+        const data = await res.json();
+        email = data.email || '';
+        if (!email) return;
+        sessionStorage.setItem(EMAIL_KEY, email);
+        showApp();
+    } catch (_) {}
+}
+
+restoreSession();
+</script>
+</body>
+</html>

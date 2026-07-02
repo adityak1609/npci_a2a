@@ -1,0 +1,117 @@
+groups:
+  - name: mindgate-policy-bot
+    rules:
+      # ── Auth & Security ───────────────────────────────────────────────────
+      - alert: A2AAuthRejectionsSpike
+        expr: increase(a2a_auth_rejections_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+          team: security
+        annotations:
+          summary: A2A authentication rejections are elevated
+          description: "{{ $value }} A2A auth rejections in 5 minutes. Possible replay attack or misconfigured NPCI partner."
+
+      - alert: LoginFailuresSpike
+        expr: increase(login_failures_total[5m]) > 20
+        for: 2m
+        labels:
+          severity: critical
+          team: security
+        annotations:
+          summary: Login failures are elevated — possible brute force
+          description: "{{ $value }} login failures in 5 minutes. Account lockout may be triggered."
+
+      - alert: RateLimitRejectionsSpike
+        expr: increase(rate_limit_rejections_total[5m]) > 50
+        for: 5m
+        labels:
+          severity: warning
+          team: ops
+        annotations:
+          summary: Rate-limit rejections are elevated
+          description: "{{ $value }} requests were rate-limited in 5 minutes. Check for abuse or misconfigured clients."
+
+      # ── API Health ────────────────────────────────────────────────────────
+      - alert: MetricsTargetDown
+        expr: up{job="mindgate-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: ops
+        annotations:
+          summary: Mindgate API is DOWN
+          description: Prometheus cannot scrape the API. The service is unreachable.
+
+      - alert: HighRequestLatency
+        expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 2
+        for: 10m
+        labels:
+          severity: warning
+          team: ops
+        annotations:
+          summary: API p95 latency is above 2 seconds
+          description: "p95 latency is {{ $value }}s. Check DB query performance, Gemini API latency, or worker backlogs."
+
+      - alert: HighErrorRate
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          team: ops
+        annotations:
+          summary: "API error rate is above 5%"
+          description: "{{ $value | humanizePercentage }} of requests are returning 5xx errors."
+
+      # ── Worker & Ingestion ────────────────────────────────────────────────
+      - alert: IngestionFailureSpike
+        expr: increase(ingestion_jobs_total{status="failed"}[15m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+          team: ops
+        annotations:
+          summary: Multiple document ingestion jobs failed
+          description: "{{ $value }} ingestion jobs failed in 15 minutes. Check worker logs and PDF validity."
+
+      - alert: WorkerQueueBacklog
+        expr: arq_queue_length > 50
+        for: 10m
+        labels:
+          severity: warning
+          team: ops
+        annotations:
+          summary: arq worker queue is backing up
+          description: "Queue length is {{ $value }}. The worker may be stuck or under-scaled."
+
+      # ── A2A Business Logic ────────────────────────────────────────────────
+      - alert: HighA2AEscalationRate
+        expr: increase(a2a_escalations_total[30m]) > 20
+        for: 5m
+        labels:
+          severity: warning
+          team: ops
+        annotations:
+          summary: A2A escalation rate is high
+          description: "{{ $value }} A2A requests escalated in 30 minutes. Confidence threshold may need recalibration."
+
+      - alert: A2ADeadLetterAccumulation
+        expr: increase(a2a_dead_letter_total[1h]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          team: ops
+        annotations:
+          summary: A2A dead-letter messages detected
+          description: "{{ $value }} A2A messages were sent to the dead-letter queue in the last hour. Immediate investigation required."
+
+      # ── Audit & Compliance ────────────────────────────────────────────────
+      - alert: AuditExportFailure
+        expr: increase(audit_export_failures_total[1h]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          team: compliance
+        annotations:
+          summary: Audit log export failed
+          description: The immutable audit export job failed. This may breach regulatory requirements.

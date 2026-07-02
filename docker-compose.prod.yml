@@ -1,0 +1,249 @@
+services:
+  migrate:
+    build: .
+    image: mindgate-policy-bot:${APP_IMAGE_TAG:-v1.0.0}
+    restart: "no"
+    env_file:
+      - ${PROD_ENV_FILE:-.env.production}
+    command: ["alembic", "upgrade", "head"]
+    networks:
+      - app-net
+    secrets:
+      - secret_key
+      - database_url
+      - redis_url
+      - google_api_key
+      - npci_api_key
+      - npci_client_cert
+      - npci_client_key
+      - a2a_hmac_secret
+      - metrics_bearer_token
+      - smtp_pass
+
+  api:
+    image: mindgate-policy-bot:${APP_IMAGE_TAG:-v1.0.0}
+    build: .
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    env_file:
+      - ${PROD_ENV_FILE:-.env.production}
+    environment:
+      # Multiprocess Prometheus: each Gunicorn worker writes metric files here;
+      # the /metrics endpoint aggregates them via MultiProcessCollector.
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prom_multiproc
+    command:
+      - gunicorn
+      - main:app
+      - --worker-class
+      - uvicorn.workers.UvicornWorker
+      - --workers
+      - ${API_WORKERS:-4}
+      - --bind
+      - 0.0.0.0:8000
+      - --forwarded-allow-ips
+      - 172.28.0.10
+      - --timeout
+      - ${API_WORKER_TIMEOUT_SECONDS:-120}
+      - --graceful-timeout
+      - ${SHUTDOWN_GRACE_SECONDS:-30}
+    expose:
+      - "8000"
+    stop_grace_period: ${SHUTDOWN_GRACE_SECONDS:-30}s
+    tmpfs:
+      - /tmp/prom_multiproc:mode=1777  # Cleared on restart; workers write metric files here
+    networks:
+      - app-net
+    deploy:
+      resources:
+        limits:
+          cpus: "${API_CPU_LIMIT:-2.0}"
+          memory: ${API_MEMORY_LIMIT:-2g}
+        reservations:
+          cpus: "${API_CPU_RESERVATION:-0.5}"
+          memory: ${API_MEMORY_RESERVATION:-512m}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    volumes:
+      - app-data:/app/data
+      - audit-exports:/app/audit_exports
+    secrets:
+      - secret_key
+      - database_url
+      - redis_url
+      - google_api_key
+      - npci_api_key
+      - npci_client_cert
+      - npci_client_key
+      - a2a_hmac_secret
+      - metrics_bearer_token
+      - smtp_pass
+
+  worker:
+    image: mindgate-policy-bot:${APP_IMAGE_TAG:-v1.0.0}
+    build: .
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    env_file:
+      - ${PROD_ENV_FILE:-.env.production}
+    command: ["python", "worker.py"]
+    volumes:
+      - app-data:/app/data
+      - audit-exports:/app/audit_exports
+    networks:
+      - app-net
+    deploy:
+      resources:
+        limits:
+          cpus: "${WORKER_CPU_LIMIT:-1.0}"
+          memory: ${WORKER_MEMORY_LIMIT:-1g}
+        reservations:
+          cpus: "${WORKER_CPU_RESERVATION:-0.25}"
+          memory: ${WORKER_MEMORY_RESERVATION:-256m}
+    secrets:
+      - secret_key
+      - database_url
+      - redis_url
+      - google_api_key
+      - npci_api_key
+      - npci_client_cert
+      - npci_client_key
+      - a2a_hmac_secret
+      - smtp_pass
+
+  reverse-proxy:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ${TLS_CERT_DIR:?set TLS_CERT_DIR containing tls.crt tls.key npci_ca.crt}:/etc/nginx/certs:ro
+    networks:
+      app-net:
+        ipv4_address: 172.28.0.10
+    deploy:
+      resources:
+        limits:
+          cpus: "${NGINX_CPU_LIMIT:-0.5}"
+          memory: ${NGINX_MEMORY_LIMIT:-256m}
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alert_rules.yml:/etc/prometheus/rules/alert_rules.yml:ro
+      - ${PROMETHEUS_CERT_DIR:?set PROMETHEUS_CERT_DIR containing tls_ca.crt}:/etc/prometheus/certs:ro
+      - prometheus-data:/prometheus
+    secrets:
+      - metrics_bearer_token
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    networks:
+      - app-net
+    deploy:
+      resources:
+        limits:
+          cpus: "${PROMETHEUS_CPU_LIMIT:-1.0}"
+          memory: ${PROMETHEUS_MEMORY_LIMIT:-1g}
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    restart: unless-stopped
+    env_file:
+      - ${PROD_ENV_FILE:-.env.production}
+    secrets:
+      - smtp_pass
+    volumes:
+      - ./deploy/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    entrypoint:
+      - /bin/sh
+      - -c
+    command:
+      - >
+        export SMTP_PASS="$$(cat /run/secrets/smtp_pass)";
+        exec /bin/alertmanager
+        --config.file=/etc/alertmanager/alertmanager.yml
+        --storage.path=/alertmanager
+        --config.expand-env
+    networks:
+      - app-net
+    deploy:
+      resources:
+        limits:
+          cpus: "${ALERTMANAGER_CPU_LIMIT:-0.5}"
+          memory: ${ALERTMANAGER_MEMORY_LIMIT:-256m}
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3000}
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    networks:
+      - app-net
+    deploy:
+      resources:
+        limits:
+          cpus: "${GRAFANA_CPU_LIMIT:-0.5}"
+          memory: ${GRAFANA_MEMORY_LIMIT:-512m}
+
+volumes:
+  app-data:
+  audit-exports:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:
+
+networks:
+  app-net:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+secrets:
+  secret_key:
+    file: ${SECRET_KEY_FILE_HOST:?set SECRET_KEY_FILE_HOST}
+  database_url:
+    file: ${DATABASE_URL_FILE_HOST:?set DATABASE_URL_FILE_HOST}
+  redis_url:
+    file: ${REDIS_URL_FILE_HOST:?set REDIS_URL_FILE_HOST}
+  google_api_key:
+    file: ${GOOGLE_API_KEY_FILE_HOST:?set GOOGLE_API_KEY_FILE_HOST}
+  npci_api_key:
+    file: ${NPCI_API_KEY_FILE_HOST:?set NPCI_API_KEY_FILE_HOST}
+  npci_client_cert:
+    file: ${NPCI_CLIENT_CERT_FILE_HOST:?set NPCI_CLIENT_CERT_FILE_HOST}
+  npci_client_key:
+    file: ${NPCI_CLIENT_KEY_FILE_HOST:?set NPCI_CLIENT_KEY_FILE_HOST}
+  a2a_hmac_secret:
+    file: ${A2A_HMAC_SECRET_FILE_HOST:?set A2A_HMAC_SECRET_FILE_HOST}
+  metrics_bearer_token:
+    file: ${METRICS_BEARER_TOKEN_FILE_HOST:?set METRICS_BEARER_TOKEN_FILE_HOST}
+  smtp_pass:
+    file: ${SMTP_PASS_FILE_HOST:?set SMTP_PASS_FILE_HOST}

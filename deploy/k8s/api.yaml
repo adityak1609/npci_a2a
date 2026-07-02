@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: npci-a2a-api
+  labels:
+    app: npci-a2a-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: npci-a2a-api
+  template:
+    metadata:
+      labels:
+        app: npci-a2a-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "8000"
+    spec:
+      containers:
+      - name: api
+        image: mindgate-policy-bot:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+        envFrom:
+        - secretRef:
+            name: npci-a2a-secrets
+        - configMapRef:
+            name: npci-a2a-config
+        env:
+        - name: PROMETHEUS_MULTIPROC_DIR
+          value: "/tmp/prom_multiproc"
+        volumeMounts:
+        - name: prom-multiproc-tmpfs
+          mountPath: /tmp/prom_multiproc
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8000
+          initialDelaySeconds: 20
+          periodSeconds: 15
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+      volumes:
+      - name: prom-multiproc-tmpfs
+        emptyDir:
+          medium: Memory
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: npci-a2a-api-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: npci-a2a-api
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: npci-a2a-api-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: npci-a2a-api
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: npci-a2a-api-svc
+spec:
+  selector:
+    app: npci-a2a-api
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8000
+  type: ClusterIP

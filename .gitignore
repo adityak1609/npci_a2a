@@ -1,0 +1,46 @@
+# Mindgate Policy Bot — .gitignore
+
+# Environment
+.env
+.env.production
+deploy/secrets/*
+!deploy/secrets/README.md
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Old FAISS index (no longer used — migrated to PostgreSQL)
+data/faiss_index/
+
+# Internal policy PDFs (confidential — do not commit)
+data/*.pdf
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes (local dev data)
+pgdata/
+
+# Virtual environments & local packaging cache
+.venv/
+.run-venv/
+.run-venv311/
+.uv-cache/
+.uv-python/
+
+# Caches
+.mypy_cache/
+.pytest_cache/
+
+# Logs
+*.log
+
+# Received dynamic files
+data/a2a_received/
+

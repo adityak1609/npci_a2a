@@ -1,0 +1,17 @@
+.git
+.agents
+.codex
+.pytest_cache
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.log
+.env
+.env.*
+!*.example
+data/*.pdf
+data/a2a_received/
+audit_exports/
+deploy/secrets/
+pgdata/
