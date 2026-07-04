@@ -68,10 +68,43 @@ def configure_logging() -> None:
 # ---------------------------------------------------------------------------
 
 # Gemini model for chat/generation
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+# Fallback models, tried in order when the primary model persistently returns a
+# transient/unavailable error.  A single provider outage on one model no longer
+# takes the whole chat surface down.  Configure via GEMINI_FALLBACK_MODELS
+# (comma-separated); empty string disables fallback.
+GEMINI_FALLBACK_MODELS = [
+    m.strip()
+    for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-2.0-flash").split(",")
+    if m.strip()
+]
+
+
+def gemini_models() -> list[str]:
+    """Primary model followed by configured fallbacks, de-duplicated in order."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for model in (GEMINI_MODEL, *GEMINI_FALLBACK_MODELS):
+        if model and model not in seen:
+            seen.add(model)
+            ordered.append(model)
+    return ordered
+
 
 # Transient error codes worth retrying
 _RETRYABLE = ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL"]
+_RETRYABLE_LLM = (
+    "429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE",
+    "500", "INTERNAL", "ReadTimeout", "DeadlineExceeded",
+)
+
+
+def is_retryable_llm_error(err: str) -> bool:
+    """True if an LLM error string looks transient and worth retry/fallback."""
+    return any(code in err for code in _RETRYABLE_LLM)
+
+
 MAX_RETRIES = 2
 
 # Number of past messages to include in context window

@@ -7,11 +7,12 @@
 """
 
 import json
+import mimetypes
 import os
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from jose import JWTError
 from sqlalchemy.orm import Session
 
@@ -21,8 +22,9 @@ from a2a_models import A2AEnvelope
 from agent import methods
 from agent.dispatcher import dispatch_rpc
 from agent.errors import INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR, rpc_error
-from auth import AUTH_COOKIE_NAME, decode_token, get_current_admin
+from auth import AUTH_COOKIE_NAME, decode_token, get_current_admin, get_current_user
 from database import (
+    A2AChange,
     A2AIngestionJob,
     AuditLog,
     DocumentSummary,
@@ -89,6 +91,18 @@ INTERNAL_METHODS = {
     methods.GET_SUMMARY,
     methods.QUERY_RAG,
     methods.ESCALATE_TO_NPCI,
+    methods.SUBMIT_COUNTER_PROPOSAL,
+    methods.REPORT_MILESTONE,
+    methods.DECLARE_READINESS,
+    methods.RAISE_BLOCKER,
+}
+
+# Methods a non-admin portal user (bank product manager) may invoke via
+# /a2a/internal. Restricted to the read/assist surface used by the shared SPA's
+# Assistant; state-changing lifecycle methods stay admin-only.
+PORTAL_METHODS = {
+    methods.QUERY_RAG,
+    methods.ESCALATE_TO_NPCI,
 }
 
 
@@ -113,7 +127,11 @@ def _bearer_token(request: Request) -> str:
     return token
 
 
-def _require_admin_jwt(request: Request, db: Session) -> None:
+def _require_session_user(request: Request, db: Session) -> User:
+    """Authenticate any active user (admin or portal) from the SPA session JWT.
+
+    Returns the User so the caller can apply role-based method allowlisting.
+    """
     token = _bearer_token(request)
     if not token:
         _audit(db, "a2a_auth_failed", "internal", "missing bearer token")
@@ -122,13 +140,21 @@ def _require_admin_jwt(request: Request, db: Session) -> None:
     try:
         payload = decode_token(token)
     except (HTTPException, JWTError):
-        _audit(db, "a2a_auth_failed", "internal", "invalid admin JWT")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin token.")
+        _audit(db, "a2a_auth_failed", "internal", "invalid session JWT")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token.")
 
     email = payload.get("sub")
     user = db.query(User).filter(User.email == email).first() if email else None
-    if not user or not user.is_admin:
-        _audit(db, "a2a_auth_failed", "internal", f"not admin: {email or 'unknown'}")
+    if not user or not user.is_active:
+        _audit(db, "a2a_auth_failed", "internal", f"unknown/inactive: {email or 'unknown'}")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token.")
+    return user
+
+
+def _require_admin_jwt(request: Request, db: Session) -> None:
+    user = _require_session_user(request, db)
+    if not user.is_admin:
+        _audit(db, "a2a_auth_failed", "internal", f"not admin: {user.email}")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin token.")
 
 
@@ -222,9 +248,10 @@ async def _dispatch_with_method_allowlist(payload, db: Session, allowed_methods:
 async def a2a_external_endpoint(request: Request, db: Session = Depends(get_db)):
     """NPCI-facing A2A endpoint secured by the full spec §4.1 auth stack.
 
-    Dispatches on the A2A envelope's ``task_type`` field against the 28
-    defined message types (+ echo).  This endpoint does NOT use custom
-    method names — it speaks the spec's vocabulary verbatim.
+    Dispatches on the A2A envelope's ``task_type`` field. All 14 Part A
+    (Phase C) message types are handled; certification (Part B) is out of
+    scope. This endpoint does NOT use custom method names — it speaks the
+    spec's vocabulary verbatim.
 
     NOTE: This is a spec-conformant endpoint for dev/cert interoperability
     with NPCI's actual platform.  Full PKI onboarding with NPCI is required
@@ -291,13 +318,28 @@ async def a2a_external_endpoint(request: Request, db: Session = Depends(get_db))
         pass
 
     try:
-        from agent.external_dispatcher import NotImplementedTaskError, dispatch_external
+        from agent.external_dispatcher import (
+            NotImplementedTaskError,
+            PayloadValidationError,
+            UnknownTaskTypeError,
+            dispatch_external,
+        )
         result = await dispatch_external(envelope, db, ctx)
     except NotImplementedTaskError as exc:
         inc_counter("a2a_not_implemented_total", {"task_type": envelope.task_type})
         return JSONResponse(
             rpc_error(request_id, -32601, str(exc), {"a2a_error": "not_implemented"}),
             status_code=501,
+        )
+    except UnknownTaskTypeError as exc:
+        return JSONResponse(
+            rpc_error(request_id, -32601, str(exc), {"a2a_error": "unknown_task_type"}),
+            status_code=400,
+        )
+    except PayloadValidationError as exc:
+        return JSONResponse(
+            rpc_error(request_id, -32602, str(exc), {"a2a_error": "payload_validation_error"}),
+            status_code=400,
         )
     except ValueError as exc:
         return JSONResponse(
@@ -321,15 +363,66 @@ async def a2a_external_endpoint(request: Request, db: Session = Depends(get_db))
 # /a2a/internal — Admin-only (unchanged)
 # ---------------------------------------------------------------------------
 
+def _stamp_acting_user(payload, user: User) -> None:
+    """Stamp the authenticated user's id into RPC params server-side.
+
+    Handlers (e.g. agent.escalate_to_npci) use ``_acting_user_id`` to record
+    who raised an escalation so NPCI updates stay scoped to that user. Any
+    client-supplied value is overwritten — it cannot be spoofed.
+    """
+    items = payload if isinstance(payload, list) else [payload]
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("params"), dict):
+            item["params"]["_acting_user_id"] = user.id
+
+
+def _claim_change_ownership(db: Session, user: User, payload) -> None:
+    """Auto-assign an unowned change to the portal user acting on it.
+
+    When a non-admin bank product manager escalates or asks about a change via
+    /a2a/internal, they become the "concerned user" for that change (unless it
+    already has an owner). This is what scopes future NPCI updates for the
+    change to that user's dashboard. Admins never auto-claim ownership.
+    """
+    if user.is_admin:
+        return
+    items = payload if isinstance(payload, list) else [payload]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        params = item.get("params")
+        change_id = (params.get("change_id") if isinstance(params, dict) else None)
+        change_id = (change_id or "").strip() if isinstance(change_id, str) else None
+        if not change_id:
+            continue
+        change = db.query(A2AChange).filter(A2AChange.change_id == change_id).first()
+        if change is not None and change.owner_user_id is None:
+            change.owner_user_id = user.id
+            _audit(db, "change_owner_claimed", change_id, f"user_id={user.id}")
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 @router.post("/a2a/internal")
 async def a2a_internal_endpoint(request: Request, db: Session = Depends(get_db)):
-    """Admin-frontend JSON-RPC endpoint secured exclusively by admin JWT."""
-    _require_admin_jwt(request, db)
+    """Shared-SPA JSON-RPC endpoint secured by session JWT.
+
+    Admins may invoke the full INTERNAL_METHODS surface; non-admin portal users
+    (bank product managers) are restricted to the read/assist PORTAL_METHODS.
+    A portal user acting on a change auto-claims ownership of it so subsequent
+    NPCI updates are scoped to them.
+    """
+    user = _require_session_user(request, db)
+    allowed_methods = INTERNAL_METHODS if user.is_admin else PORTAL_METHODS
     try:
         payload = await _read_payload(request)
     except _ParseError:
         return JSONResponse(rpc_error(None, PARSE_ERROR, "Parse error"))
-    return await _dispatch_with_method_allowlist(payload, db, INTERNAL_METHODS)
+    _stamp_acting_user(payload, user)
+    _claim_change_ownership(db, user, payload)
+    return await _dispatch_with_method_allowlist(payload, db, allowed_methods)
 
 
 @router.post("/a2a", deprecated=True)
@@ -395,6 +488,48 @@ def list_received_documents(
             "updated_at": _format_dt(row.updated_at),
         })
     return result
+
+
+@router.get("/documents/{doc_id}/download")
+def download_received_document(
+    doc_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Stream the original inbound NPCI document/attachment for download.
+
+    Available to any active user. Non-admin bank product managers may only
+    download documents belonging to a change they own; admins may download any.
+
+    The file path is taken only from the DB-stored ``stored_path`` (never from
+    user input), so there is no path-traversal surface. Returns 404 if the row
+    is missing or the file is no longer on disk.
+    """
+    doc = db.query(ReceivedDocument).filter(ReceivedDocument.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    if not current_user.is_admin:
+        change = (
+            db.query(A2AChange).filter(A2AChange.change_id == doc.change_id).first()
+            if doc.change_id else None
+        )
+        # Block only documents on a change owned by a DIFFERENT user. Documents
+        # on the caller's own changes — and on unassigned/"common" changes that
+        # are shared with everyone — remain downloadable.
+        if change is not None and change.owner_user_id is not None and change.owner_user_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have access to this document.",
+            )
+    path = doc.stored_path
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Document file is not available on disk.")
+    media, _ = mimetypes.guess_type(doc.filename or "")
+    return FileResponse(
+        path,
+        media_type=media or "application/octet-stream",
+        filename=doc.filename or f"document_{doc_id}",
+    )
 
 
 @router.post("/ingestion-jobs/{job_id}/retry")

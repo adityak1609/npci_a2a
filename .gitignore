@@ -44,3 +44,16 @@ pgdata/
 # Received dynamic files
 data/a2a_received/
 
+
+# Coverage artifacts
+.coverage
+coverage.xml
+htmlcov/
+
+# Frontend build
+frontend/node_modules/
+frontend/dist/
+
+# Local-only / generated artifacts
+.claude/settings.local.json
+guardrail_report.json

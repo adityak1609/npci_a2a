@@ -7,6 +7,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from auth import (
@@ -14,12 +15,14 @@ from auth import (
     Token,
     User,
     UserLogin,
+    authenticate_user,
     authenticate_user_for_role,
     create_access_token,
     create_mfa_pending_token,
     decode_mfa_pending_token,
     generate_totp_secret,
     get_current_admin,
+    get_current_user,
     get_totp_provisioning_uri,
     revoke_token,
     verify_totp,
@@ -111,6 +114,42 @@ def admin_login(
         raise HTTPException(status_code=500, detail="Admin login failed.")
 
 
+@router.post("/auth/login/session", tags=["Auth"])
+def session_login(
+    data: UserLogin,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """Authenticate any active account (admin or portal user) for the shared SPA.
+
+    Role-agnostic counterpart to /auth/admin/login: both administrators and
+    non-admin bank product managers sign in here. The MFA gate still applies to
+    any account that has enabled it (in practice, admins).
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit("login_ip", client_ip, limit=env_int("LOGIN_RATE_LIMIT_PER_MINUTE", 10))
+    check_rate_limit("login_email", data.email.lower(), limit=env_int("LOGIN_EMAIL_RATE_LIMIT_PER_MINUTE", 5))
+    check_login_lockout(data.email)
+    try:
+        user = authenticate_user(db, data.email, data.password)
+        # --- MFA gate --- (returns a short-lived pending token, not a session)
+        if user.mfa_enabled:
+            mfa_token = create_mfa_pending_token(user.email)
+            _write_audit_log(db, user.id, "login_mfa_required", target="session", detail=client_ip)
+            return {"mfa_required": True, "mfa_token": mfa_token}
+        _write_audit_log(db, user.id, "login", target="session", detail=client_ip)
+        return _login_response(user, response)
+    except HTTPException:
+        inc_counter("login_failures_total", {"route": "session"})
+        record_login_failure(data.email)
+        _write_audit_log(db, None, "login_failed", target="session", detail=data.email)
+        raise
+    except Exception as e:
+        logger.exception("Internal error in session_login", exc_info=e)
+        raise HTTPException(status_code=500, detail="Login failed.")
+
+
 @router.post("/auth/login", response_model=Token, tags=["Auth"], deprecated=True)
 def login(
     data: UserLogin,
@@ -140,13 +179,13 @@ def login(
 
 
 @router.get("/auth/me", tags=["Auth"])
-def auth_me(current_admin: User = Depends(get_current_admin)):
-    """Return the current administrator profile for cookie-backed SPA auth."""
+def auth_me(current_user: User = Depends(get_current_user)):
+    """Return the current profile for cookie-backed SPA auth (admin or portal user)."""
     return {
-        "id": current_admin.id,
-        "email": current_admin.email,
-        "full_name": current_admin.full_name,
-        "is_admin": current_admin.is_admin,
+        "id": current_user.id,
+        "email": current_user.email,
+        "full_name": current_user.full_name,
+        "is_admin": current_user.is_admin,
     }
 
 
@@ -187,7 +226,7 @@ def require_metrics_access(
 @router.post("/auth/refresh", response_model=Token, tags=["Auth"])
 def auth_refresh(
     response: Response,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -212,20 +251,17 @@ def auth_refresh(
 # MFA Endpoints
 # ---------------------------------------------------------------------------
 
-class MfaVerifyRequest(BaseModel if False else object):
-    pass
-
-from pydantic import BaseModel as _BaseModel
-
-class MfaVerifyRequest(_BaseModel):
+class MfaVerifyRequest(BaseModel):
     mfa_token: str
     code: str
 
-class MfaSetupResponse(_BaseModel):
+
+class MfaSetupResponse(BaseModel):
     totp_uri: str
     secret: str  # Shown ONCE; user must save this
 
-class MfaEnableRequest(_BaseModel):
+
+class MfaEnableRequest(BaseModel):
     code: str  # Confirm TOTP code before enabling
 
 

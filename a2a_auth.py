@@ -307,11 +307,13 @@ def verify_hmac(request: Request, raw_body: bytes, db: Session) -> None:
         )
 
     # --- Nonce replay ---
+    # Expired-nonce garbage collection is handled out-of-band by the periodic
+    # cleanup task (_cleanup_expired_security_rows in main.py). Doing a DELETE +
+    # commit on every inbound request here caused needless write amplification
+    # on the hot auth path, so it has been removed. A lingering expired nonce is
+    # still safe: reuse is treated as a replay (fail-closed) and the row is
+    # reaped on the next cleanup tick.
     nonce_ttl = int(os.getenv("A2A_NONCE_TTL_SECONDS", "600"))
-    db.query(A2ANonce).filter(A2ANonce.expires_at < datetime.now(timezone.utc)).delete(
-        synchronize_session=False
-    )
-    db.commit()
     existing_nonce = db.query(A2ANonce).filter(A2ANonce.nonce == nonce_header).first()
     if existing_nonce:
         raise A2AAuthError(
@@ -366,7 +368,7 @@ def verify_hmac(request: Request, raw_body: bytes, db: Session) -> None:
 # Layer 4: JWT verification + session check
 # ---------------------------------------------------------------------------
 
-def verify_jwt_session(request: Request) -> Optional[str]:
+def verify_jwt_session(request: Request, db: Session) -> Optional[str]:
     """Verify the JWT Bearer token and return the subject (email/partner_id).
 
     Returns the JWT ``sub`` claim on success.
@@ -405,10 +407,21 @@ def verify_jwt_session(request: Request) -> Optional[str]:
             http_status=401,
         )
 
-    # Check for session revocation (if you maintain a session table).
-    # For now, the JWT expiry check in decode_token handles expiration.
-    # Add session_revoked / session_expired checks here when a session
-    # table is implemented.
+    # Session revocation: a leaked or logged-out partner JWT must stop working
+    # before its natural expiry.  decode_token() already enforces the exp
+    # claim; here we reject any jti that has been added to revoked_sessions
+    # (mirrors the browser get_current_user() check).
+    jti = payload.get("jti")
+    if jti:
+        from database import RevokedSession
+
+        revoked = db.query(RevokedSession).filter(RevokedSession.jti == jti).first()
+        if revoked:
+            raise A2AAuthError(
+                A2AErrorCode.SESSION_REVOKED,
+                "JWT session has been revoked.",
+                http_status=401,
+            )
 
     return sub
 
@@ -615,7 +628,7 @@ async def a2a_external_auth(
     verify_hmac(request, raw_body, db)
 
     # Layer 4: JWT (optional for external, primary auth is HMAC)
-    jwt_sub = verify_jwt_session(request)
+    jwt_sub = verify_jwt_session(request, db)
 
     # Parse the JSON body to extract the envelope
     try:

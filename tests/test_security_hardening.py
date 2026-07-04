@@ -11,7 +11,7 @@ from a2a_models import A2ATaskType
 from agent.external_dispatcher import (
     EXTERNAL_HANDLERS,
     NotImplementedTaskError,
-    handle_cert_config_request,
+    _not_implemented_handler,
 )
 from a2a_auth import (
     A2AAuthContext,
@@ -78,7 +78,7 @@ def test_unimplemented_npci_task_is_rejected_not_acknowledged():
         },
     )
     with pytest.raises(NotImplementedTaskError):
-        asyncio.run(handle_cert_config_request(envelope, None, A2AAuthContext()))
+        asyncio.run(_not_implemented_handler(envelope, None, A2AAuthContext()))
 
 
 def test_external_dispatcher_has_explicit_handler_for_every_task_type():

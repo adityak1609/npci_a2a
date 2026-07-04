@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session
 from agent.dispatcher import _get_genai_client
 from auth import User, get_current_admin, get_current_user
 from compliance import ComplianceBlockedError, require_external_ai_approval
-from config import GEMINI_MODEL, env_int
+from config import env_int, gemini_models, is_retryable_llm_error
 from database import (
     A2AIngestionJob,
     ChatMessage,
@@ -438,15 +438,46 @@ async def chat_stream_endpoint(
         loop = asyncio.get_running_loop()
 
         def _stream_to_queue():
-            """Run in a thread: push each token onto the queue, then a sentinel."""
+            """Run in a thread: push each token onto the queue, then a sentinel.
+
+            Tries each configured model in order. Falling back is only safe
+            *before* any token has been emitted, because emitted tokens are
+            already accumulated by the consumer; once streaming has begun a
+            failure is surfaced rather than restarted on a different model.
+            """
+            models = gemini_models()
+            emitted = False
+            last_error: Exception | None = None
             try:
-                stream = _get_genai_client().models.generate_content_stream(
-                    model=GEMINI_MODEL,
-                    contents=contents,
-                )
-                for chunk in stream:
-                    if chunk.text:
-                        loop.call_soon_threadsafe(queue.put_nowait, ("token", chunk.text))
+                for model_index, model in enumerate(models):
+                    try:
+                        stream = _get_genai_client().models.generate_content_stream(
+                            model=model,
+                            contents=contents,
+                        )
+                        for chunk in stream:
+                            if chunk.text:
+                                emitted = True
+                                loop.call_soon_threadsafe(
+                                    queue.put_nowait, ("token", chunk.text)
+                                )
+                        return  # Completed successfully on this model.
+                    except Exception as exc:
+                        last_error = exc
+                        can_fallback = (
+                            not emitted
+                            and is_retryable_llm_error(str(exc))
+                            and model_index < len(models) - 1
+                        )
+                        if can_fallback:
+                            logger.warning(
+                                "Gemini stream model exhausted; falling back",
+                                extra={"model": model, "next_model": models[model_index + 1]},
+                            )
+                            continue
+                        raise
+                if last_error is not None:
+                    raise last_error
             except Exception as exc:
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
             finally:

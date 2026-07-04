@@ -274,11 +274,63 @@ def _biz_key_proposal_acknowledged(params: dict) -> Optional[tuple]:
     return None
 
 
+def _biz_key_change_acknowledgement(params: dict) -> Optional[tuple]:
+    change_id = params.get("change_id")
+    version = params.get("version_accepted")
+    if change_id and version is not None:
+        return ("change_acknowledgement", change_id, str(version))
+    return None
+
+
+def _biz_key_counter_proposal(params: dict) -> Optional[tuple]:
+    cp_id = params.get("counter_proposal_id")
+    return ("counter_proposal", cp_id) if cp_id else None
+
+
+def _biz_key_counter_decision(params: dict) -> Optional[tuple]:
+    cp_id = params.get("in_response_to")
+    return ("counter_decision", cp_id) if cp_id else None
+
+
+def _biz_key_blocker(params: dict) -> Optional[tuple]:
+    blk_id = params.get("blocker_id")
+    return ("blocker", blk_id) if blk_id else None
+
+
+def _biz_key_blocker_resolution(params: dict) -> Optional[tuple]:
+    blk_id = params.get("blocker_id")
+    return ("blocker_resolution", blk_id) if blk_id else None
+
+
+def _biz_key_milestone_update(params: dict) -> Optional[tuple]:
+    change_id = params.get("change_id")
+    milestone = params.get("milestone")
+    state = params.get("state")
+    if change_id and milestone and state:
+        return ("milestone_update", change_id, milestone, state)
+    return None
+
+
+def _biz_key_readiness_declaration(params: dict) -> Optional[tuple]:
+    change_id = params.get("change_id")
+    version = params.get("version_implementing")
+    if change_id and version is not None:
+        return ("readiness_declaration", change_id, str(version))
+    return None
+
+
 _BUSINESS_KEY_EXTRACTORS: dict[str, callable] = {
     A2ATaskType.CHANGE_COMMUNICATION: _biz_key_change_communication,
     A2ATaskType.CERT_CASE_RESULT: _biz_key_cert_case_result,
     A2ATaskType.QUERY: _biz_key_query,
     A2ATaskType.PROPOSAL_ACKNOWLEDGED: _biz_key_proposal_acknowledged,
+    A2ATaskType.CHANGE_ACKNOWLEDGEMENT: _biz_key_change_acknowledgement,
+    A2ATaskType.COUNTER_PROPOSAL: _biz_key_counter_proposal,
+    A2ATaskType.COUNTER_DECISION: _biz_key_counter_decision,
+    A2ATaskType.BLOCKER: _biz_key_blocker,
+    A2ATaskType.BLOCKER_RESOLUTION: _biz_key_blocker_resolution,
+    A2ATaskType.MILESTONE_UPDATE: _biz_key_milestone_update,
+    A2ATaskType.READINESS_DECLARATION: _biz_key_readiness_declaration,
 }
 
 

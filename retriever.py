@@ -112,6 +112,13 @@ def _visibility_filter_sql(visibility_tiers: list[str] | None) -> str:
     return "AND visibility_tier IN :visibility_tiers"
 
 
+def _change_filter_sql(change_id: str | None) -> str:
+    """Optional filter that scopes retrieval to a single change's documents."""
+    if not change_id:
+        return ""
+    return "AND change_id = :change_id"
+
+
 def _execute_visibility_query(db: Session, sql: str, params: dict, visibility_tiers: list[str] | None):
     stmt = text(sql)
     if visibility_tiers:
@@ -120,7 +127,12 @@ def _execute_visibility_query(db: Session, sql: str, params: dict, visibility_ti
     return db.execute(stmt, params).fetchall()
 
 
-def retrieve(query: str, top_k: int = TOP_K, visibility_tiers: list[str] | None = None) -> list[str]:
+def retrieve(
+    query: str,
+    top_k: int = TOP_K,
+    visibility_tiers: list[str] | None = None,
+    change_id: str | None = None,
+) -> list[str]:
     """
     Retrieve the most relevant policy chunks for a given query.
 
@@ -132,6 +144,7 @@ def retrieve(query: str, top_k: int = TOP_K, visibility_tiers: list[str] | None 
     Args:
         query:  Natural-language question from the user.
         top_k:  Number of chunks to return (default: 5).
+        change_id: When set, restrict retrieval to that change's documents.
 
     Returns:
         List of text strings — the most relevant policy chunks.
@@ -161,6 +174,17 @@ def retrieve(query: str, top_k: int = TOP_K, visibility_tiers: list[str] | None 
         # pgvector cosine distance operator: <=> 
         # Lower distance = more similar
         # Filter out provisional chunks (amends_change responses not yet authoritative)
+        params = {
+            "vec": vec_str,
+            "k": top_k,
+            "bias_npci_official": bias_npci_official,
+            "bias_npci_agent": bias_npci_agent,
+            "bias_admin_upload": bias_admin_upload,
+            "bias_old_policy": bias_old_policy,
+            "bias_default": bias_default,
+        }
+        if change_id:
+            params["change_id"] = change_id
         rows = _execute_visibility_query(
             db,
             f"""
@@ -168,6 +192,7 @@ def retrieve(query: str, top_k: int = TOP_K, visibility_tiers: list[str] | None 
                 FROM document_chunks
                 WHERE (provisional IS NULL OR provisional = FALSE)
                   {_visibility_filter_sql(visibility_tiers)}
+                  {_change_filter_sql(change_id)}
                 ORDER BY
                     (embedding <=> CAST(:vec AS vector)) +
                     CASE source
@@ -179,15 +204,7 @@ def retrieve(query: str, top_k: int = TOP_K, visibility_tiers: list[str] | None 
                     END
                 LIMIT :k
             """,
-            {
-                "vec": vec_str,
-                "k": top_k,
-                "bias_npci_official": bias_npci_official,
-                "bias_npci_agent": bias_npci_agent,
-                "bias_admin_upload": bias_admin_upload,
-                "bias_old_policy": bias_old_policy,
-                "bias_default": bias_default
-            },
+            params,
             visibility_tiers,
         )
     finally:
@@ -200,6 +217,7 @@ def retrieve_with_scores(
     query: str,
     top_k: int = TOP_K,
     visibility_tiers: list[str] | None = None,
+    change_id: str | None = None,
 ) -> list[dict]:
     """
     Retrieve chunks with pgvector cosine distance for confidence scoring.
@@ -207,6 +225,8 @@ def retrieve_with_scores(
     Args:
         query: Natural-language question from the user.
         top_k: Number of chunks to return.
+        change_id: When set, restrict retrieval to that change's documents
+            (change-scoped assistant).
 
     Returns:
         Dicts with ``text`` and ``distance`` keys, ordered by best match first.
@@ -228,6 +248,17 @@ def retrieve_with_scores(
     db = SessionLocal()
     try:
         # Filter out provisional chunks and return change_id + citations
+        params = {
+            "vec": vec_str,
+            "k": top_k,
+            "bias_npci_official": bias_npci_official,
+            "bias_npci_agent": bias_npci_agent,
+            "bias_admin_upload": bias_admin_upload,
+            "bias_old_policy": bias_old_policy,
+            "bias_default": bias_default,
+        }
+        if change_id:
+            params["change_id"] = change_id
         rows = _execute_visibility_query(
             db,
             f"""
@@ -238,6 +269,7 @@ def retrieve_with_scores(
                 FROM document_chunks
                 WHERE (provisional IS NULL OR provisional = FALSE)
                   {_visibility_filter_sql(visibility_tiers)}
+                  {_change_filter_sql(change_id)}
                 ORDER BY
                     (embedding <=> CAST(:vec AS vector)) +
                     CASE source
@@ -249,15 +281,7 @@ def retrieve_with_scores(
                     END
                 LIMIT :k
             """,
-            {
-                "vec": vec_str,
-                "k": top_k,
-                "bias_npci_official": bias_npci_official,
-                "bias_npci_agent": bias_npci_agent,
-                "bias_admin_upload": bias_admin_upload,
-                "bias_old_policy": bias_old_policy,
-                "bias_default": bias_default
-            },
+            params,
             visibility_tiers,
         )
     finally:

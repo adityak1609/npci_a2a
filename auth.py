@@ -8,6 +8,7 @@ Provides:
     - Pydantic schemas for register / login requests
 """
 
+import hashlib
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -51,16 +52,90 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15")
 AUTH_COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "mg_access_token")
 
 # ---------------------------------------------------------------------------
+# Password policy
+# ---------------------------------------------------------------------------
+# bcrypt only hashes the first 72 bytes of a password and silently ignores the
+# rest.  Rather than let long passphrases lose entropy, we pre-hash every
+# password with SHA-256 and base64-encode the digest (44 ASCII bytes, safely
+# under the 72-byte ceiling) before feeding it to bcrypt.  This makes the full
+# password contribute to the hash and removes the truncation footgun.  The
+# scheme is versioned via a stored prefix so legacy raw-bcrypt hashes still
+# verify.
+MIN_PASSWORD_LENGTH = int(os.getenv("MIN_PASSWORD_LENGTH", "12"))
+MAX_PASSWORD_LENGTH = int(os.getenv("MAX_PASSWORD_LENGTH", "128"))
+_PREHASH_PREFIX = "sha256$"
+
+
+def validate_password_strength(password: str) -> None:
+    """Enforce the password policy. Raises HTTPException 400 on violation.
+
+    Policy: length within [MIN_PASSWORD_LENGTH, MAX_PASSWORD_LENGTH] and at
+    least three of the four character classes (lower, upper, digit, symbol).
+    """
+    if password is None or len(password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters long.",
+        )
+    if len(password) > MAX_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Password must be at most {MAX_PASSWORD_LENGTH} characters long.",
+        )
+    classes = sum(
+        bool(match)
+        for match in (
+            any(c.islower() for c in password),
+            any(c.isupper() for c in password),
+            any(c.isdigit() for c in password),
+            any(not c.isalnum() for c in password),
+        )
+    )
+    if classes < 3:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Password must include at least three of: lowercase, uppercase, "
+                "digit, and symbol."
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Password hashing  (direct bcrypt — compatible with bcrypt 4.x / 5.x)
 # ---------------------------------------------------------------------------
+def _bcrypt_payload(plain: str) -> bytes:
+    """Return the 72-byte-safe bcrypt input for a plain-text password.
+
+    Pre-hashing with SHA-256 means the entire password contributes to the
+    resulting bcrypt hash, defeating bcrypt's silent 72-byte truncation.
+    """
+    import base64
+
+    digest = hashlib.sha256(plain.encode("utf-8")).digest()
+    return base64.b64encode(digest)
+
+
 def hash_password(plain: str) -> str:
-    """Return a bcrypt hash of the plain-text password."""
-    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    """Return a versioned bcrypt hash of the (SHA-256 pre-hashed) password."""
+    hashed = bcrypt.hashpw(_bcrypt_payload(plain), bcrypt.gensalt()).decode("utf-8")
+    return f"{_PREHASH_PREFIX}{hashed}"
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    """Return True if plain matches the hashed password."""
-    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    """Return True if plain matches the hashed password.
+
+    Transparently supports both the new ``sha256$``-prefixed pre-hashed scheme
+    and legacy raw-bcrypt hashes so existing accounts keep working.
+    """
+    try:
+        if hashed.startswith(_PREHASH_PREFIX):
+            stored = hashed[len(_PREHASH_PREFIX):].encode("utf-8")
+            return bcrypt.checkpw(_bcrypt_payload(plain), stored)
+        # Legacy hashes were computed directly over the raw password bytes.
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except (ValueError, TypeError):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +229,11 @@ def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User account not found. Please register again.",
         )
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="This account has been deactivated.",
+        )
     return user
 
 
@@ -206,7 +286,7 @@ def get_current_admin(
 # ---------------------------------------------------------------------------
 class UserCreate(BaseModel):
     """Registration request body."""
-    email: str
+    email: EmailStr
     password: str
     full_name: Optional[str] = None
 
@@ -246,6 +326,7 @@ def register_user(db: Session, data: UserCreate) -> User:
     Raises:
         HTTPException 400 if the email is already registered.
     """
+    validate_password_strength(data.password)
     if db.query(User).filter(User.email == data.email).first():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -272,11 +353,21 @@ def authenticate_user(db: Session, email: str, password: str) -> User:
     Raises:
         HTTPException 401 if credentials are invalid.
     """
-    user = db.query(User).filter(User.email == email).first()
+    # Accept either an email or a portal username in the identifier field.
+    user = (
+        db.query(User)
+        .filter((User.email == email) | (User.username == email))
+        .first()
+    )
     if not user or not verify_password(password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password.",
+        )
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This account has been deactivated.",
         )
     return user
 

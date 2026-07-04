@@ -97,7 +97,7 @@ We have a convenient PowerShell script that ensures Docker is running, starts th
 .\start.ps1
 ```
 
-Open **http://localhost:8000** in your browser to log in and use the chatbot.
+Open **http://localhost:8000** in your browser to sign in to the Partner Platform portal.
 
 User registration always creates a standard account. To provision an administrator,
 promote an existing account through a trusted database operation:
@@ -105,6 +105,23 @@ promote an existing account through a trusted database operation:
 ```powershell
 docker exec mindgate_postgres psql -U postgres -d mindgate_db -c "UPDATE users SET is_admin = TRUE WHERE email = 'admin@mindgate.com';"
 ```
+
+### 6. Frontend (Partner Platform portal)
+
+The portal is a React + Vite + TypeScript + Tailwind SPA in `frontend/`. FastAPI
+serves the built bundle from `frontend/dist/` at `/` and `/admin/*`, with hashed
+assets under `/assets`.
+
+```bash
+cd frontend
+npm ci
+npm run build      # → frontend/dist, served by FastAPI
+# or, for hot-reload development against a running API on :8000
+npm run dev        # Vite dev server on http://localhost:5173 (proxies /auth,/admin,/a2a,…)
+```
+
+The production Docker image builds the SPA in a `node:20` stage and copies
+`dist/` into the Python image — no manual build step needed for containers.
 
 ---
 
@@ -146,7 +163,7 @@ and includes Prometheus scraping and alert rules.
 Production startup expects Alembic-managed schema state. Run `alembic upgrade
 head` before the API, set `APP_ENV=production`, configure `REDIS_URL`, and run
 `python worker.py` with `A2A_INGESTION_MODE=worker` for ingestion. See
-`PRODUCTION_RUNBOOK.md` for the full deployment sequence.
+`docs/PRODUCTION_RUNBOOK.md` for the full deployment sequence.
 
 ---
 

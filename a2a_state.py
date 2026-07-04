@@ -69,15 +69,19 @@ CERT_TRANSITIONS: dict[CERT, set[CERT]] = {
 CHANGE_TASK_TARGET: dict[str, CLS] = {
     A2ATaskType.CHANGE_COMMUNICATION:       CLS.COMMUNICATED,
     A2ATaskType.PROPOSAL_ACKNOWLEDGED:      CLS.RECEIVED,
+    A2ATaskType.CHANGE_ACKNOWLEDGEMENT:     CLS.ACCEPTED,
     A2ATaskType.COUNTER_PROPOSAL:           CLS.COUNTER_PROPOSAL,
-    A2ATaskType.COUNTER_PROPOSAL_RESPONSE:  CLS.COMMUNICATED,
-    A2ATaskType.CHANGE_ACCEPTED:            CLS.ACCEPTED,
-    A2ATaskType.DESIGN_SUBMISSION:          CLS.DESIGN_COMPLETED,
-    A2ATaskType.DESIGN_REVIEW:              CLS.DESIGN_COMPLETED,  # Stays in same state
-    A2ATaskType.CODING_COMPLETE:            CLS.CODING_COMPLETED,
-    A2ATaskType.TEST_RESULTS:               CLS.TESTED,
-    A2ATaskType.CHANGE_REJECTED:            CLS.ABORTED,
-    A2ATaskType.CHANGE_ABORTED:             CLS.ABORTED,
+    A2ATaskType.COUNTER_DECISION:           CLS.COMMUNICATED,  # re-communication loop
+    A2ATaskType.READINESS_DECLARATION:      CLS.READY_FOR_CERTIFICATION,
+    # milestone_update is payload-dependent — see MILESTONE_TARGET below.
+}
+
+# milestone_update moves the change to a milestone completion state, but only
+# when the reported milestone reaches state == "completed" (spec §Appendix B).
+MILESTONE_TARGET: dict[str, CLS] = {
+    "design":  CLS.DESIGN_COMPLETED,
+    "coding":  CLS.CODING_COMPLETED,
+    "testing": CLS.TESTED,
 }
 
 # Maps each task_type to the Cert lifecycle state it moves the cflow into.
@@ -96,7 +100,9 @@ CERT_TASK_TARGET: dict[str, CERT] = {
     A2ATaskType.CERT_ABORTED:               CERT.ABORTED,
 }
 
-# Task types that are "stateless" — they don't transition the lifecycle.
+# Task types that are "stateless" — they don't transition the change/cert
+# lifecycle chain. (blocker* set a separate blocked flag; milestone_status_* and
+# query/clarification are informational.)
 STATELESS_TASK_TYPES: set[str] = {
     A2ATaskType.ECHO,
     A2ATaskType.STATUS_REQUEST,
@@ -104,7 +110,27 @@ STATELESS_TASK_TYPES: set[str] = {
     A2ATaskType.NOTIFICATION,
     A2ATaskType.QUERY,
     A2ATaskType.CLARIFICATION_RESPONSE,
+    A2ATaskType.MILESTONE_STATUS_REQUEST,
+    A2ATaskType.MILESTONE_STATUS_REPORT,
+    A2ATaskType.BLOCKER,
+    A2ATaskType.BLOCKER_STATUS_UPDATE,
+    A2ATaskType.BLOCKER_RESOLUTION,
 }
+
+
+def change_target_state(task_type: str, payload: dict | None = None) -> CLS | None:
+    """Resolve the Change-lifecycle state a task_type moves the change into.
+
+    ``milestone_update`` is payload-dependent: it only advances when the
+    reported milestone has ``state == "completed"``. Returns None when the
+    task_type does not advance the change lifecycle.
+    """
+    if task_type == A2ATaskType.MILESTONE_UPDATE:
+        if payload and payload.get("state") == "completed":
+            milestone = payload.get("milestone")
+            return MILESTONE_TARGET.get(milestone) if isinstance(milestone, str) else None
+        return None
+    return CHANGE_TASK_TARGET.get(task_type)
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +168,8 @@ def validate_transition(envelope, db) -> None:
         return
 
     # --- Change lifecycle ---
-    if task_type in CHANGE_TASK_TARGET:
+    target = change_target_state(task_type, getattr(envelope, "payload", None))
+    if target is not None:
         change_id = envelope.change_id
         if not change_id:
             return  # No change_id — can't validate, let handler decide
@@ -155,7 +182,6 @@ def validate_transition(envelope, db) -> None:
                 return  # Will be created by handler
             # If change exists, validate version bump (re-communication)
             current = CLS(change.current_state)
-            target = CHANGE_TASK_TARGET[task_type]
             # Re-communication is valid from COUNTER_PROPOSAL (v+1)
             if current == CLS.COUNTER_PROPOSAL:
                 return  # Valid: counter-proposal → re-communicated
@@ -173,7 +199,6 @@ def validate_transition(envelope, db) -> None:
             )
 
         current = CLS(change.current_state)
-        target = CHANGE_TASK_TARGET[task_type]
         if not _is_valid_change_transition(current, target):
             raise ValueError(
                 f"Invalid state transition for change '{change_id}': "
@@ -224,23 +249,31 @@ def validate_transition(envelope, db) -> None:
 # State advancement (validate + persist)
 # ---------------------------------------------------------------------------
 
-def advance_change_state(change_id: str, task_type: str, db) -> CLS:
+def advance_change_state(change_id: str, task_type: str, db, payload: dict | None = None) -> CLS:
     """Advance the change lifecycle state after successful handler execution.
 
     Returns the new state.  Creates the change record if it doesn't exist
     (for change_communication creating a new change).
     """
-    target = CHANGE_TASK_TARGET.get(task_type)
+    target = change_target_state(task_type, payload)
     if not target:
-        return None  # Not a change-lifecycle task type
+        return None  # Not a change-lifecycle task type (or non-advancing milestone)
+
+    from datetime import datetime, timezone
+    # change_communication carries the human-readable title/version the dashboards
+    # display; capture them so changes aren't shown as bare change_ids.
+    p = payload or {}
+    p_title = p.get("title")
+    p_version = p.get("version")
 
     change = db.query(A2AChange).filter(A2AChange.change_id == change_id).first()
     if not change:
         # Create a new change (e.g., first change_communication)
-        from datetime import datetime, timezone
         change = A2AChange(
             change_id=change_id,
             current_state=target.value,
+            title=p_title,
+            version=p_version,
         )
         db.add(change)
         db.commit()
@@ -248,7 +281,11 @@ def advance_change_state(change_id: str, task_type: str, db) -> CLS:
         return target
 
     change.current_state = target.value
-    from datetime import datetime, timezone
+    # Backfill title/version from later messages if they weren't set at creation.
+    if p_title and not change.title:
+        change.title = p_title
+    if p_version is not None:
+        change.version = p_version
     change.updated_at = datetime.now(timezone.utc)
     db.commit()
     return target

@@ -15,3 +15,5 @@ data/a2a_received/
 audit_exports/
 deploy/secrets/
 pgdata/
+frontend/node_modules/
+frontend/dist/

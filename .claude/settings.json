@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./**/*.log)",
+      "Read(./.venv/**)",
+      "Read(./.run-venv/**)",
+      "Read(./.run-venv311/**)",
+      "Read(./.uv-cache/**)",
+      "Read(./.uv-python/**)",
+      "Read(./.mypy_cache/**)",
+      "Read(./.pytest_cache/**)",
+      "Read(./__pycache__/**)",
+      "Read(./htmlcov/**)",
+      "Read(./data/a2a_received/**)",
+      "Read(./pgdata/**)"
+    ]
+  }
+}

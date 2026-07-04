@@ -48,7 +48,8 @@ def _outbound_cert():
 
 
 def _signed_headers(raw_body: bytes) -> dict:
-    api_key = os.getenv("NPCI_API_KEY")
+    from services.settings_store import get_setting
+    api_key = get_setting("NPCI_API_KEY", os.getenv("NPCI_API_KEY"))
     if not api_key:
         raise EnvironmentError("NPCI_API_KEY must be set.")
 
@@ -56,7 +57,7 @@ def _signed_headers(raw_body: bytes) -> dict:
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    hmac_secret = os.getenv("A2A_HMAC_SECRET", "").strip()
+    hmac_secret = (get_setting("A2A_HMAC_SECRET", os.getenv("A2A_HMAC_SECRET")) or "").strip()
     if hmac_secret:
         timestamp = str(int(time.time()))
         nonce = f"{uuid.uuid4().hex}{uuid.uuid4().hex}"[:32]
@@ -77,7 +78,8 @@ def _signed_headers(raw_body: bytes) -> dict:
 
 async def post_npci_rpc(rpc_payload: dict) -> dict:
     """POST a JSON-RPC payload to NPCI with retry and outbound auth headers."""
-    url = os.getenv("NPCI_AGENT_URL")
+    from services.settings_store import get_setting
+    url = get_setting("NPCI_AGENT_URL", os.getenv("NPCI_AGENT_URL"))
     if not url:
         raise EnvironmentError("NPCI_AGENT_URL must be set.")
 
@@ -173,6 +175,8 @@ async def _route_to_internal_review(query_text: str, params: dict) -> dict:
             ticket_id=generated_ticket_id,
             query=query_text,
             status="internal_review",
+            # Injected server-side by /a2a/internal — scopes updates to the raiser.
+            raised_by_user_id=params.get("_acting_user_id"),
         ))
         db.add(AuditLog(
             admin_id=None,
@@ -282,6 +286,7 @@ async def _send_npci_query(
                 phase=phase,
                 bank_interpretation=bank_interpretation,
                 priority=params.get("priority", "normal"),
+                raised_by_user_id=params.get("_acting_user_id"),
             ))
             db.add(AuditLog(
                 admin_id=None,
@@ -313,6 +318,7 @@ async def _send_npci_query(
                 phase=phase,
                 bank_interpretation=bank_interpretation,
                 priority=params.get("priority", "normal"),
+                raised_by_user_id=params.get("_acting_user_id"),
             ))
         db.add(AuditLog(
             admin_id=None,

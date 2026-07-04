@@ -131,6 +131,49 @@ When using the compose stack, step 2 is handled by the `migrate` service and
 steps 3-4 are handled by the `api` and `worker` services. The app still refuses
 production startup if the database is not at Alembic head.
 
+## Trust Boundary (READ BEFORE EXPOSING)
+
+Several security controls trust headers and the peer IP that the reverse proxy
+supplies. If the application process is reachable by anything other than the
+proxy, these controls can be spoofed and bypassed. Treat the following as hard
+requirements, not recommendations.
+
+- **Never expose the app port directly.** Bind Gunicorn/Uvicorn to a private
+  interface or the compose/K8s internal network only. The proxy is the sole
+  ingress. mTLS fingerprint pinning, the CIDR allowlist, and the `X-SSL-Client-*`
+  checks all assume the app only ever sees traffic from the trusted proxy.
+
+- **Strip client-supplied trust headers at the edge.** The proxy MUST overwrite
+  (not append) these on every inbound request so a client cannot forge them:
+  `X-SSL-Client-Verify`, `X-SSL-Client-Fingerprint`,
+  `X-SSL-Client-SHA256-Fingerprint`, `X-SSL-Client-Cert`, and `X-Forwarded-For`.
+  A request arriving at the proxy carrying its own `X-SSL-Client-*` header is an
+  attack and should be rejected or scrubbed.
+
+- **Make `request.client.host` the real client IP.** The CIDR allowlist
+  (`A2A_CIDR_ALLOWLIST`) and login/rate-limit keys read `request.client.host`.
+  Behind a proxy that is the *proxy's* IP unless the ASGI server is told to
+  honour `X-Forwarded-For` from the proxy only:
+
+  ```powershell
+  gunicorn main:app --worker-class uvicorn.workers.UvicornWorker `
+    --workers 4 --bind 127.0.0.1:8000 --forwarded-allow-ips "10.0.0.0/8"
+  ```
+
+  Set `--forwarded-allow-ips` (or `FORWARDED_ALLOW_IPS`) to the proxy's address
+  range — never `*` in production, which would let any client dictate its own
+  source IP and defeat the CIDR allowlist.
+
+- **Fail closed.** If the proxy cannot verify a client certificate it must send
+  `X-SSL-Client-Verify: FAILED` (or omit the cert) rather than forwarding the
+  request unlabelled. The app rejects `NONE`/non-`SUCCESS` when
+  `A2A_MTLS_REQUIRED=true`.
+
+The startup validator (`_validate_security_config` in `main.py`) enforces that
+mTLS, the CIDR allowlist, fingerprint/partner maps, and HTTPS-only CORS origins
+are configured in production, but it cannot detect a misrouted network path —
+that is an operational responsibility verified here.
+
 ## Monitoring
 
 Scrape:

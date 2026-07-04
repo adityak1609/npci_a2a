@@ -5,7 +5,14 @@ from sqlalchemy.orm import Session
 from auth import User
 from database import ChatSession, ChatMessage
 from guardrails import sanitize_question
-from config import GEMINI_MODEL, VERIFIED_STREAM_CHUNK_SIZE, CHAT_MEMORY_SIZE, MAX_RETRIES
+from config import (
+    GEMINI_MODEL,
+    VERIFIED_STREAM_CHUNK_SIZE,
+    CHAT_MEMORY_SIZE,
+    MAX_RETRIES,
+    gemini_models,
+    is_retryable_llm_error,
+)
 import time
 from telemetry import _log_internal_error
 from metrics import time_request
@@ -17,9 +24,9 @@ _RETRYABLE = ["429", "503", "500", "ReadTimeout"]
 from agent.dispatcher import _get_genai_client
 from datetime import timezone
 
-def _generate_content_once(contents: list) -> str:
+def _generate_content_once(contents: list, model: str = GEMINI_MODEL) -> str:
     response = _get_genai_client().models.generate_content(
-        model=GEMINI_MODEL,
+        model=model,
         contents=contents,
     )
     return response.text or ""
@@ -28,29 +35,52 @@ def _generate_content_once(contents: list) -> str:
 
 
 async def _generate_with_retry(contents: list) -> str:
-    """Call Gemini generate_content with fast retry on transient errors."""
+    """Call Gemini generate_content with fast retry + cross-model fallback.
+
+    Each configured model is retried on transient errors; when a model is
+    exhausted, the next fallback model is attempted so a single-model outage
+    does not fail the request.
+    """
     require_external_ai_approval("chat answer generation")
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            started = time_request()
-            result = await asyncio.to_thread(_generate_content_once, contents)
-            observe_histogram(
-                "gemini_api_latency_seconds",
-                time_request() - started,
-                labels={"call_type": "chat"},
-            )
-            return result
-        except Exception as e:
-            err = str(e)
-            if any(code in err for code in _RETRYABLE) and attempt < MAX_RETRIES:
-                wait = min(attempt + 1, 2)  # 1s, 2s — fast retries
-                logger.warning(
-                    "Gemini transient error; retrying",
-                    extra={"attempt": attempt + 1, "max_retries": MAX_RETRIES, "wait": wait},
+    models = gemini_models()
+    last_error: Exception | None = None
+    for model_index, model in enumerate(models):
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                started = time_request()
+                result = await asyncio.to_thread(_generate_content_once, contents, model)
+                observe_histogram(
+                    "gemini_api_latency_seconds",
+                    time_request() - started,
+                    labels={"call_type": "chat"},
                 )
-                await asyncio.sleep(wait)
-            else:
-                raise
+                return result
+            except Exception as e:
+                last_error = e
+                err = str(e)
+                if is_retryable_llm_error(err) and attempt < MAX_RETRIES:
+                    wait = min(attempt + 1, 2)  # 1s, 2s — fast retries
+                    logger.warning(
+                        "Gemini transient error; retrying",
+                        extra={
+                            "model": model,
+                            "attempt": attempt + 1,
+                            "max_retries": MAX_RETRIES,
+                            "wait": wait,
+                        },
+                    )
+                    await asyncio.sleep(wait)
+                elif is_retryable_llm_error(err) and model_index < len(models) - 1:
+                    # Exhausted retries on this model — fall back to the next.
+                    logger.warning(
+                        "Gemini model exhausted; falling back",
+                        extra={"model": model, "next_model": models[model_index + 1]},
+                    )
+                    break
+                else:
+                    raise
+    if last_error:
+        raise last_error
     raise RuntimeError("Gemini retry loop exhausted without a response.")
 
 

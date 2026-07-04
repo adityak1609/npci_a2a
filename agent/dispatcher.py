@@ -142,17 +142,41 @@ async def _get_summary(params: dict, db) -> dict:
     }
 
 
-async def _query_rag(params: dict) -> dict:
-    """agent.query_rag; params: query/session_id; returns non-streaming RAG result.
+# Phrases the grounded prompt (prompt.py) instructs the model to emit when the
+# context cannot answer the question. Matched case-insensitively.
+_NON_ANSWER_MARKERS = (
+    "couldn't find a clear answer",
+    "could not find a clear answer",
+    "does not contain enough information",
+    "doesn't contain enough information",
+    "check with your compliance team",
+    "check with hr for the authoritative interpretation",
+    "sections appear to have different provisions",
+)
 
-    When suggest_escalation is True, also returns ``chunk_change_id`` from
-    the best-matching chunk (if any).  The frontend uses this to determine
-    whether to show "Escalate to NPCI" (change_id exists) or "Route to
-    internal review" (no associated change).
+
+def _is_non_answer(answer: str | None) -> bool:
+    """True when the generated answer is a grounded refusal/ambiguity notice."""
+    if not answer:
+        return True
+    lowered = answer.lower()
+    return any(marker in lowered for marker in _NON_ANSWER_MARKERS)
+
+
+async def _query_rag(params: dict) -> dict:
+    """agent.query_rag; params: query/change_id; returns non-streaming RAG result.
+
+    When ``change_id`` is provided, retrieval is scoped to that change's
+    documents only (the portal Assistant tab). When suggest_escalation is True,
+    also returns ``chunk_change_id`` from the best-matching chunk (if any).  The
+    frontend uses this to determine whether to show "Escalate to NPCI"
+    (change_id exists) or "Route to internal review" (no associated change).
     """
     query = (params.get("query") or "").strip()
     if not query:
         raise ValueError("query is required.")
+
+    change_id = (params.get("change_id") or "").strip() or None
 
     regex_guard = _check_regex(query)
     if regex_guard.blocked:
@@ -175,7 +199,7 @@ async def _query_rag(params: dict) -> dict:
         }
 
     clean_query = sanitize_question(query)
-    rows = retrieve_with_scores(clean_query, 5)
+    rows = retrieve_with_scores(clean_query, 5, change_id=change_id)
     if not rows:
         return {
             "answer": None,
@@ -212,6 +236,20 @@ async def _query_rag(params: dict) -> dict:
         ],
     )
     answer = check_output(response.text or "", [row["text"] for row in rows])
+
+    # Retrieval confidence alone can pass the threshold while the LLM still
+    # cannot answer from the context (grounding rule §3 in prompt.py makes it
+    # say so explicitly). Detect those non-answers so the frontend can offer
+    # "Raise query to NPCI" instead of presenting a dead end.
+    if _is_non_answer(answer):
+        _log_confidence_sample(rows[0]["distance"], confidence, threshold, suggest_escalation=True)
+        return {
+            "answer": answer,
+            "confidence": round(confidence, 3),
+            "suggest_escalation": True,
+            "chunk_change_id": best_change_id,
+            "message": answer,
+        }
 
     # Collect citations from matched chunks
     citations = []
@@ -266,6 +304,18 @@ async def _dispatch_single(payload: dict, db) -> dict | None:
             result = await _query_rag(params)
         elif method == methods.ESCALATE_TO_NPCI:
             result = await handle_escalate(params)
+        elif method == methods.SUBMIT_COUNTER_PROPOSAL:
+            from services.npci_outbound import submit_counter_proposal
+            result = await submit_counter_proposal(params)
+        elif method == methods.REPORT_MILESTONE:
+            from services.npci_outbound import report_milestone
+            result = await report_milestone(params)
+        elif method == methods.DECLARE_READINESS:
+            from services.npci_outbound import declare_readiness
+            result = await declare_readiness(params)
+        elif method == methods.RAISE_BLOCKER:
+            from services.npci_outbound import raise_blocker
+            result = await raise_blocker(params)
         else:
             if is_notification:
                 return None

@@ -13,6 +13,7 @@ Endpoints:
 """
 
 import os
+import re
 import json
 import time
 import secrets as token_secrets
@@ -97,7 +98,7 @@ client = genai.Client(api_key=google_api_key)
 # FastAPI app with lifespan
 # ---------------------------------------------------------------------------
 _nonce_cleanup_task = None
-EXPECTED_ALEMBIC_REVISION = "20260702_0005_documents"
+EXPECTED_ALEMBIC_REVISION = "20260702_0006_part_a_portal"
 
 # ---------------------------------------------------------------------------
 # SQL constants — maintenance queries used by the periodic cleanup task.
@@ -425,15 +426,47 @@ VERIFIED_STREAM_CHUNK_SIZE = 96
 # Helpers
 # ---------------------------------------------------------------------------
 frontend_dir = os.path.join(os.path.dirname(__file__), "frontend")
+frontend_dist = os.path.join(frontend_dir, "dist")
+
+# Serve the built Vite bundle's hashed assets. check_dir=False so an unbuilt
+# dev tree does not crash app import; the multi-stage Docker build produces dist/.
+app.mount(
+    "/assets",
+    StaticFiles(directory=os.path.join(frontend_dist, "assets"), check_dir=False),
+    name="assets",
+)
+
+# Inject a CSP nonce into every <script>/<style> opening tag that does not
+# already carry one.  A regex — rather than a naive str.replace of "<script>"
+# — ensures tags written with attributes (e.g. <script type="module">,
+# <style media="...">) are also nonced and therefore not blocked by the
+# strict Content-Security-Policy.  The lookahead `(?=[\s>])` requires a
+# complete tag name so `<scripting>`-style tokens are never matched, and
+# `(?![^>]*\bnonce=)` avoids double-injecting.
+_CSP_TAG_RE = re.compile(
+    r"<(script|style)(?=[\s>])(?![^>]*\bnonce=)",
+    re.IGNORECASE,
+)
+
+
+def _inject_csp_nonce(html: str, nonce: str) -> str:
+    if not nonce:
+        return html
+    return _CSP_TAG_RE.sub(lambda m: f'<{m.group(1)} nonce="{nonce}"', html)
+
 
 def _frontend_response(request: Request) -> HTMLResponse:
     csp_nonce = getattr(request.state, "csp_nonce", "")
-    index_path = os.path.join(frontend_dir, "index.html")
+    index_path = os.path.join(frontend_dist, "index.html")
+    if not os.path.isfile(index_path):
+        return HTMLResponse(
+            "<h1>Partner Platform</h1><p>Frontend bundle not built. Run "
+            "<code>npm ci &amp;&amp; npm run build</code> in <code>frontend/</code>.</p>",
+            status_code=200,
+        )
     with open(index_path, "r", encoding="utf-8") as file:
         html = file.read()
-    html = html.replace("<style>", f'<style nonce="{csp_nonce}">')
-    html = html.replace("<script>", f'<script nonce="{csp_nonce}">')
-    return HTMLResponse(html)
+    return HTMLResponse(_inject_csp_nonce(html, csp_nonce))
 
 
 @app.get("/", tags=["Frontend"])

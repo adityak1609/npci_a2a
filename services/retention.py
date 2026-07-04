@@ -128,11 +128,15 @@ def anonymize_user_data(db: Session, user_id: int) -> dict[str, int]:
         ChatSession.user_id == user_id
     ).delete(synchronize_session=False)
 
-    # Anonymize the user record itself (don't hard-delete to preserve FK integrity)
+    # Anonymize the user record itself (don't hard-delete to preserve FK integrity).
+    # The account is also deactivated and its username scrubbed so it can no
+    # longer log in and is dropped from the admin user list.
     user.email = f"deleted_{user_id}@deleted.invalid"
     user.hashed_password = "[deleted]"
     user.full_name = "[deleted]"
     user.is_admin = False
+    user.is_active = False
+    user.username = None
 
     db.commit()
     return {

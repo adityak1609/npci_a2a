@@ -1,0 +1,120 @@
+# Architecture & Repository Layout
+
+This document maps the codebase so contributors can navigate a repository whose
+core modules currently live in a **flat layout** (all at the repo root). It also
+records the recommended target package layout and the exact touchpoints a future
+migration must update.
+
+## Runtime entrypoints
+
+| Command | File | Purpose |
+| --- | --- | --- |
+| `uvicorn main:app` | `main.py` | FastAPI app: middleware, CORS, CSP, router wiring, lifespan (DB init, job recovery, nonce cleanup). |
+| `python worker.py` | `worker.py` | Out-of-process ingestion worker (`A2A_INGESTION_MODE=worker`). |
+
+## Core modules (flat, repo root)
+
+Grouped by responsibility. These are plain top-level modules imported absolutely
+(e.g. `from database import ...`).
+
+### Platform / infrastructure
+| Module | Responsibility |
+| --- | --- |
+| `config.py` | Shared configuration and logging helpers. |
+| `database.py` | SQLAlchemy engine, session, ORM models, `init_db`. |
+| `secrets_loader.py` | Load secrets from `*_FILE` paths into the environment. |
+| `telemetry.py` | OpenTelemetry distributed tracing setup. |
+| `metrics.py` | Prometheus metrics (multi-process Gunicorn aware). |
+| `csrf.py` | Origin/Referer CSRF protection for cookie-auth routes. |
+| `rate_limit.py` | Rate limiting for security-sensitive endpoints. |
+| `utils.py` | Shared helpers. |
+
+### Authentication
+| Module | Responsibility |
+| --- | --- |
+| `auth.py` | User auth, JWT issue/revoke, role dependencies, login models. |
+
+### A2A protocol (Bank-side)
+| Module | Responsibility |
+| --- | --- |
+| `a2a_models.py` | A2A message/envelope schemas. |
+| `a2a_auth.py` | HMAC / mTLS / JWT credential binding for A2A. |
+| `a2a_state.py` | A2A task/idempotency state. |
+| `a2a_audit.py` | A2A-specific audit trail. |
+
+### RAG / AI
+| Module | Responsibility |
+| --- | --- |
+| `retriever.py` | Vector retrieval over document chunks. |
+| `ingest.py` | PDF ingestion pipeline. |
+| `prompt.py` | Prompt construction. |
+| `embedding_config.py` | Shared embedding dimensionality config. |
+| `guardrails.py` | Input/output guardrails, verified-stream buffering. |
+
+### Compliance & validation
+| Module | Responsibility |
+| --- | --- |
+| `compliance.py` | External-AI data-processing approval gate. |
+| `file_validation.py` | Validate files before OCR/parse/embed/store. |
+| `audit_export.py` | Export and verify append-only audit logs. |
+
+## Existing packages
+
+| Package | Contents |
+| --- | --- |
+| `routes/` | FastAPI routers: `a2a`, `admin`, `auth`, `chat`, `feedback`, `sys`, `ws`. |
+| `services/` | A2A ingestor/vision/reply, NPCI client/outbound, retention, task queue, email, settings/KB stores. |
+| `agent/` | A2A dispatch: `dispatcher`, `external_dispatcher`, `methods`, `errors`. |
+| `ws/` | WebSocket connection manager. |
+
+## Supporting directories
+
+| Dir | Purpose |
+| --- | --- |
+| `alembic/` | DB migrations (`versions/`) + `env.py`. |
+| `frontend/` | React/Vite SPA (`src/`), built to `frontend/dist`. |
+| `tests/` | Unit tests; `tests/integration/` needs Postgres/pgvector. |
+| `deploy/` | nginx, k8s, prometheus, grafana, alertmanager, secrets. |
+| `docs/` | Project documentation (this file + tech-stack, runbook, security notes). |
+| `mock_npci_agent/` | Local NPCI counterpart for end-to-end testing. |
+| `load_tests/`, `tools/`, `scripts/` | Locust load test, ad-hoc tools, ops scripts. |
+| `ai_compliance_docs/`, `data/` | Compliance agreement, seed data / docs. |
+
+---
+
+## Recommended target layout (not yet applied)
+
+The flat core modules are the main structural debt. A future migration should
+consolidate them into a single importable package:
+
+```
+app/
+  main.py            # entrypoint -> app.main:app
+  worker.py          # entrypoint -> python -m app.worker
+  core/              config, database, utils, secrets_loader, telemetry,
+                     metrics, csrf, rate_limit
+  auth/              auth
+  a2a/               models, auth, state, audit
+  rag/               retriever, ingest, prompt, embedding_config, guardrails
+  compliance/        compliance, file_validation, audit_export
+  routes/  services/  agent/  ws/     # moved under app/ unchanged
+```
+
+### Migration touchpoints (do all in one PR, then run the test suite)
+Moving the core modules rewrites **~160 import statements across ~45 files**.
+Beyond the imports, these must be updated together or the app breaks:
+
+1. **Frontend path in `main.py`** — `frontend_dir` is derived from `__file__`
+   (`os.path.dirname(__file__)`). If `main.py` moves into `app/`, this must walk
+   up one more level, or it will look for `app/frontend`.
+2. **Entrypoints** — `Dockerfile` (`main:app`), `docker-compose.prod.yml`
+   (`main:app`, `worker.py`), `docker-compose.yml`, `start.ps1` (`main:app`).
+3. **CI** — `.github/workflows/ci.yml` mypy step hardcodes the flat module list.
+4. **Alembic** — `alembic/env.py` and `versions/20260629_0001_baseline_schema.py`
+   import from `database`; migration files are historically frozen, so prefer a
+   compatibility shim or update them deliberately.
+5. **Config** — `mypy.ini` package bases, `pyproject.toml` coverage sources.
+
+### Verification
+`python -m pytest --collect-only -q` catches every broken import (baseline: 104
+tests collect). Follow with the full unit run; integration tests require Postgres.

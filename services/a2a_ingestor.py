@@ -143,8 +143,11 @@ def _store_processed_document(
     chunks: list[str],
     embeddings: list[list[float]],
     summary: str,
+    change_id: str | None = None,
 ) -> tuple[int, int]:
     source_file = f"a2a_{document_id}_{filename}"
+    # Tag chunks with the change they belong to so change-scoped RAG can filter.
+    change_id = change_id or metadata.get("change_id")
     db = SessionLocal()
     try:
         db.query(DocumentChunk).filter(
@@ -165,6 +168,7 @@ def _store_processed_document(
                 source=source,
                 content_type=file_type,
                 source_doc=filename,
+                change_id=change_id,
                 metadata_json=metadata_json,
             ))
 
@@ -202,6 +206,7 @@ async def process_ingestion_job(job_id: int) -> None:
         source = document.source
         file_type = document.file_type
         stored_path = document.stored_path
+        change_id = document.change_id
         metadata = json.loads(document.metadata_json or "{}")
     finally:
         db.close()
@@ -240,12 +245,30 @@ async def process_ingestion_job(job_id: int) -> None:
             chunks,
             embeddings,
             summary,
+            change_id,
         )
         _set_job_status(job_id, "ready")
 
+        # Notification is best-effort: the document is already stored and the job
+        # is "ready". A failing SMTP/webhook must not flip a successful ingestion
+        # to "failed" (e.g. bad Gmail credentials returning 535 BadCredentials).
         recipients = _approved_recipients(metadata.get("notify_list") or [])
         if recipients:
-            await asyncio.to_thread(send_ingest_email, filename, metadata, summary, recipients)
+            try:
+                await asyncio.to_thread(send_ingest_email, filename, metadata, summary, recipients)
+            except Exception as notify_exc:
+                print(f"[a2a] Ingestion job {job_id} ready but notification failed: {notify_exc}")
+                _db = SessionLocal()
+                try:
+                    _db.add(AuditLog(
+                        admin_id=None,
+                        action="a2a_notify_failed",
+                        target=filename,
+                        detail=str(notify_exc)[:500],
+                    ))
+                    _db.commit()
+                finally:
+                    _db.close()
 
         print(f"[a2a] Ingestion job {job_id} ready: doc={doc_id}, chunks={chunk_count}")
     except Exception as exc:

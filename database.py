@@ -76,9 +76,11 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String(255), unique=True, nullable=False, index=True)
+    username = Column(String(150), unique=True, nullable=True, index=True)  # portal display login; NULL for legacy email-only accounts
     hashed_password = Column(String(255), nullable=False)
     full_name = Column(String(255), nullable=True)
     is_admin = Column(Boolean, default=False, nullable=False, server_default="false")
+    is_active = Column(Boolean, default=True, nullable=False, server_default="true")
     mfa_enabled = Column(Boolean, default=False, nullable=False, server_default="false")
     totp_secret = Column(String(64), nullable=True)  # Base32-encoded TOTP secret; NULL = MFA not configured
     visibility_tier = Column(String(50), nullable=False, default="admin", server_default="admin")
@@ -349,6 +351,12 @@ class NpciTicket(Base):
     status = Column(String(50), nullable=False, default="pending", server_default="pending")
     answer = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    # Portal user who raised the escalation — scopes dashboard visibility so
+    # one user's escalations (and NPCI's answers) never appear on another
+    # user's feed. Null for system/legacy tickets (falls back to change owner).
+    raised_by_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
 
     # ── Spec §Appendix B — query/clarification_response fields ────────────
     change_id = Column(String(100), nullable=True)
@@ -456,7 +464,69 @@ class A2AChange(Base):
     current_state = Column(String(50), nullable=False, default="ASSIGNED")
     version = Column(Integer, nullable=True)
     partner_id = Column(String(100), nullable=True)
+    title = Column(String(512), nullable=True)  # from change_communication.title, for the dashboard
     metadata_json = Column(Text, nullable=True)
+    # Concerned bank product manager for this change. NPCI updates (counter
+    # proposal decisions, blocker resolutions, milestone acks, ticket answers)
+    # for this change are surfaced ONLY to this user's portal dashboard. Set by
+    # admin assignment or auto-claimed when a portal user first acts on the
+    # change via /a2a/internal.
+    owner_user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    blocked_at = Column(DateTime, nullable=True)       # spec: assignment.blocked_at
+    blocked_reason = Column(Text, nullable=True)       # spec: assignment.blocked_reason
+    # Soft delete: an admin can remove a change from the board, dashboards, and
+    # the Assistant change picker without destroying its audit trail.
+    deleted_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    owner = relationship("User", foreign_keys=[owner_user_id])
+
+    __table_args__ = (
+        Index("ix_a2a_changes_change_id", "change_id"),
+        Index("ix_a2a_changes_state", "current_state"),
+        Index("ix_a2a_changes_owner_user_id", "owner_user_id"),
+    )
+
+
+class HiddenUpdate(Base):
+    """An update item an admin has hidden from users' portal dashboards.
+
+    Identified by (kind, ref) matching the update feed items produced by the
+    portal dashboard — e.g. kind='document' ref='<doc id>', kind='counter_proposal'
+    ref='<counter_proposal_id>'. Hidden items are filtered out of what non-admin
+    users see; admins still see them (flagged) so they can restore.
+    """
+    __tablename__ = "hidden_updates"
+
+    id = Column(Integer, primary_key=True)
+    kind = Column(String(50), nullable=False)
+    ref = Column(String(200), nullable=False)
+    hidden_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint("kind", "ref", name="uq_hidden_update_kind_ref"),
+    )
+
+
+class A2ACounterProposal(Base):
+    """A Bank→NPCI counter_proposal and NPCI's counter_decision (spec §Appendix B)."""
+    __tablename__ = "a2a_counter_proposals"
+
+    id = Column(Integer, primary_key=True)
+    counter_proposal_id = Column(String(100), unique=True, nullable=False)
+    change_id = Column(String(100), nullable=False)
+    version_targeted = Column(Integer, nullable=True)
+    status = Column(String(50), nullable=False, default="open", server_default="open")  # open | decided
+    counters_json = Column(Text, nullable=True)   # the proposed counters[]
+    decision_json = Column(Text, nullable=True)    # NPCI per_counter[] decision
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(
         DateTime,
@@ -465,8 +535,84 @@ class A2AChange(Base):
     )
 
     __table_args__ = (
-        Index("ix_a2a_changes_change_id", "change_id"),
-        Index("ix_a2a_changes_state", "current_state"),
+        Index("ix_a2a_counter_proposals_change", "change_id"),
+        Index("ix_a2a_counter_proposals_status", "status"),
+    )
+
+
+class A2ABlocker(Base):
+    """A Bank→NPCI blocker plus NPCI status updates / resolution (spec §Appendix B)."""
+    __tablename__ = "a2a_blockers"
+
+    id = Column(Integer, primary_key=True)
+    blocker_id = Column(String(100), unique=True, nullable=False)
+    change_id = Column(String(100), nullable=False)
+    type = Column(String(100), nullable=True)
+    severity = Column(String(50), nullable=True)
+    subject = Column(String(512), nullable=True)
+    status = Column(String(50), nullable=False, default="open", server_default="open")  # open | <npci status> | resolved | wontfix | deferred
+    resolution = Column(String(50), nullable=True)  # resolved | wontfix | deferred
+    resolution_text = Column(Text, nullable=True)
+    crm_json = Column(Text, nullable=True)
+    payload_json = Column(Text, nullable=True)  # original blocker payload
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_a2a_blockers_change", "change_id"),
+        Index("ix_a2a_blockers_status", "status"),
+    )
+
+
+class A2AMilestone(Base):
+    """Latest per-milestone state for a change — the milestone_status_report source."""
+    __tablename__ = "a2a_milestones"
+
+    id = Column(Integer, primary_key=True)
+    change_id = Column(String(100), nullable=False)
+    milestone = Column(String(50), nullable=False)  # design | coding | testing
+    state = Column(String(50), nullable=False)      # in_progress | completed | at_risk | ...
+    version_implementing = Column(Integer, nullable=True)
+    notes = Column(Text, nullable=True)
+    eta = Column(String(50), nullable=True)
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("change_id", "milestone", name="uq_a2a_milestone_change_ms"),
+        Index("ix_a2a_milestones_change", "change_id"),
+    )
+
+
+class AppSetting(Base):
+    """Runtime-editable configuration surfaced in the portal Settings page.
+
+    Values here override environment defaults via the settings resolver so an
+    admin can reconfigure the NPCI connection etc. without a redeploy. Secrets
+    are marked is_secret and never echoed back to the UI in plaintext.
+    """
+    __tablename__ = "app_settings"
+
+    id = Column(Integer, primary_key=True)
+    key = Column(String(100), unique=True, nullable=False, index=True)
+    value = Column(Text, nullable=True)
+    category = Column(String(50), nullable=False, default="general", server_default="general")
+    is_secret = Column(Boolean, default=False, nullable=False, server_default="false")
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_app_settings_category", "category"),
     )
 
 
@@ -652,8 +798,19 @@ def init_db() -> None:
             WITH (m = 16, ef_construction = 64)
         """))
 
-    if not env_bool("ALLOW_LEGACY_INLINE_MIGRATIONS", default=False):
-        return
+    if env_bool("ALLOW_LEGACY_INLINE_MIGRATIONS", default=False):
+        _apply_legacy_inline_migrations()
+
+
+def _apply_legacy_inline_migrations() -> None:
+    """Legacy in-place ALTER/CREATE migrations for pre-Alembic dev databases.
+
+    Dead by default — gated behind ALLOW_LEGACY_INLINE_MIGRATIONS and retained
+    only as an escape hatch for upgrading an old local database in place.
+    Production schema state is owned exclusively by Alembic (see
+    _assert_database_migrated in main.py), so this path never runs there.
+    """
+    from sqlalchemy import text
 
     # Migrate existing tables: add is_admin column if it doesn't exist yet.
     # This is safe to run repeatedly (IF NOT EXISTS semantics).
@@ -739,6 +896,7 @@ def init_db() -> None:
             "approver VARCHAR(255)",
             "generation_mode VARCHAR(50)",
             "provisional BOOLEAN DEFAULT FALSE",
+            "raised_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL",
         ]:
             conn.execute(text(
                 f"ALTER TABLE npci_tickets ADD COLUMN IF NOT EXISTS {col_def}"

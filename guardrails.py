@@ -154,7 +154,11 @@ _p(r"(answer|respond|reply)\s+(using|based\s+on|from|with)\s+(your\s+)?(general|
 _p(r"(the\s+)?(policy|document|context)\s+(is|are|seems?)\s+(outdated|wrong|incorrect|old|stale|inaccurate|incomplete).{0,40}(use|rely|switch|fall\s*back)", "jailbreak")
 _p(r"use\s+(your\s+)?(own|general|real|actual|pre-?trained|inherent)\s+(knowledge|training|understanding|data|information)", "jailbreak")
 _p(r"(give|provide|tell)\s+(me\s+)?(the\s+)?(full|complete|real|actual|unrestricted|unfiltered)\s+answer\s+(even\s+if|regardless|whether\s+or\s+not|no\s+matter)", "jailbreak")
-_p(r"(DAN|do\s+anything\s+now|AIM|STAN|DUDE|BetterDAN|GPT-?4\s+simulator)\s*(mode)?", "jailbreak")
+# Jailbreak persona handles are uppercase acronyms in real attacks; keep them
+# case-sensitive and word-bounded so they don't match inside ordinary words
+# (e.g. "underSTANd", "attenDANce", "AIM"/"DUDE" as plain words).
+_p(r"\b(?-i:DAN|AIM|STAN|DUDE|BetterDAN)\b\s*(mode)?", "jailbreak")
+_p(r"(do\s+anything\s+now|GPT-?4\s+simulator)\s*(mode)?", "jailbreak")
 _p(r"jailbreak", "jailbreak")
 _p(r"SYSTEM\s*OVERRIDE", "jailbreak")
 _p(r"(stop|quit|cease)\s+being\s+(a\s+)?(policy|company|HR|corporate)\s*(bot|assistant|chatbot)?", "jailbreak")
