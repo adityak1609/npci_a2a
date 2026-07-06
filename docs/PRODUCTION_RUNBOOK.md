@@ -129,7 +129,38 @@ python worker.py
 
 When using the compose stack, step 2 is handled by the `migrate` service and
 steps 3-4 are handled by the `api` and `worker` services. The app still refuses
-production startup if the database is not at Alembic head.
+production startup if the database is not at Alembic head (the expected head is
+derived from the checked-in migration scripts, so code and schema can never
+drift apart silently).
+
+6. Bootstrap the first administrator (fresh database only):
+
+```powershell
+$env:ADMIN_BOOTSTRAP_PASSWORD = "<strong password>"
+python scripts/create_admin.py --email ops@yourbank.example --full-name "Ops Admin"
+Remove-Item Env:ADMIN_BOOTSTRAP_PASSWORD
+```
+
+All further users are created by that admin via the portal (`POST /admin/users`).
+
+### Connection Capacity
+
+Each process holds its own SQLAlchemy pool of `DB_POOL_SIZE + DB_MAX_OVERFLOW`
+connections (default 5 + 10 = 15). PostgreSQL must therefore allow at least
+`15 x (API_WORKERS + ingestion workers)` connections — with the default 4 API
+workers plus 1 ingestion worker that is 75, which fits a stock
+`max_connections = 100`. If you scale workers or replicas, either lower the
+per-process pool or put PgBouncer in front; do not raise the pool blindly.
+
+### Scheduled Maintenance
+
+- The **ingestion worker** (`worker.py`) runs the daily data-retention purge
+  after `RETENTION_HOUR_UTC` (default 02:00 UTC), guarded by a Postgres
+  advisory lock so multiple replicas never run it twice.
+- The API's periodic nonce/ticket cleanup and startup recovery are also
+  advisory-lock elected — only one Gunicorn worker performs them.
+- Account lockout state lives in the `login_failures` table (not Redis), so a
+  Redis outage can never weaken it.
 
 ## Trust Boundary (READ BEFORE EXPOSING)
 

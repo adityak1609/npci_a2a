@@ -42,7 +42,7 @@ def run_smoke_test():
     assert resp.status_code == 200, f"Ingestion failed: {resp.text}"
     print("✓ Ingestion triggered.")
     
-    time.sleep(2)  # Wait for ingestion via arq queue (or worker thread)
+    time.sleep(2)  # Wait for ingestion (inline task or worker process)
     
     # 4. Chat
     session_id = str(uuid.uuid4())

@@ -1,8 +1,8 @@
 """
 services/retention.py — Data retention and GDPR-compliant deletion.
 
-Scheduled daily by the arq worker. Purges expired data per configurable
-retention windows to comply with data minimization principles and
+Scheduled daily by the ingestion worker (worker.py). Purges expired data per
+configurable retention windows to comply with data minimization principles and
 reduce storage/privacy risk.
 """
 from __future__ import annotations
@@ -19,6 +19,7 @@ from database import (
     AuditLog,
     ChatMessage,
     ChatSession,
+    LoginFailure,
     RevokedSession,
     SessionLocal,
     User,
@@ -87,6 +88,15 @@ def run_retention(db: Session) -> dict[str, int]:
         .delete(synchronize_session=False)
     )
     results["revoked_sessions_purged"] = deleted_revoked
+
+    # 6. Purge stale login-failure rows (lockout only looks at the last
+    # LOGIN_LOCKOUT_WINDOW_SECONDS; anything older than a day is dead weight)
+    deleted_login_failures = (
+        db.query(LoginFailure)
+        .filter(LoginFailure.created_at < now - timedelta(days=1))
+        .delete(synchronize_session=False)
+    )
+    results["login_failures_purged"] = deleted_login_failures
 
     db.commit()
     logger.info(f"retention: run complete: {results}")

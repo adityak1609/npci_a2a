@@ -151,28 +151,73 @@ def check_a2a_external_rate_limit(scope: str) -> None:
     check_rate_limit(scope, scope, limit=env_int("A2A_EXTERNAL_RATE_LIMIT_PER_MINUTE", 100))
 
 # --- Account Lockout Logic ---
+#
+# Lockout state lives in Postgres (login_failures table), NOT in the
+# Redis/in-memory limiter above.  The limiter fails open to per-process
+# memory when Redis is down, which would multiply the allowed attempts by
+# the number of Gunicorn workers — unacceptable for a security control.
+# Postgres is already a hard dependency of the login path, so a DB outage
+# cannot weaken the lockout (login itself is down).
+
 def record_login_failure(email: str) -> None:
-    """Record a login failure for the given email to enforce lockout."""
-    # We leverage the same rate limiter mechanics, but with a longer window
-    # 5 failures in 15 minutes = locked out for the remainder of the window.
+    """Persist a failed login attempt for lockout accounting.
+
+    Never raises: this runs inside the auth-failure handler and must not
+    convert a 401 into a 500 if the insert fails.
+    """
+    from database import LoginFailure, SessionLocal
+
+    db = SessionLocal()
     try:
-        check_rate_limit("login_lockout", email.lower(), limit=4, window_seconds=900)
-    except HTTPException:
-        pass  # Just recording, check_login_lockout will enforce
+        db.add(LoginFailure(email=email.strip().lower()))
+        db.commit()
+    except Exception:
+        db.rollback()
+        import logging
+        logging.getLogger(__name__).exception("Failed to record login failure")
+    finally:
+        db.close()
+
 
 def check_login_lockout(email: str) -> None:
-    """Check if the account is currently locked due to too many failed attempts."""
-    # Attempting to 'check' with limit=5 effectively enforces the lockout
+    """Raise 403 when the account has too many recent failed logins.
+
+    Policy: LOGIN_LOCKOUT_THRESHOLD failures (default 5) within
+    LOGIN_LOCKOUT_WINDOW_SECONDS (default 900) lock the account for the
+    remainder of the window, measured from the oldest failure in it.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from database import LoginFailure, SessionLocal
+
+    threshold = _env_int("LOGIN_LOCKOUT_THRESHOLD", 5)
+    window_seconds = _env_int("LOGIN_LOCKOUT_WINDOW_SECONDS", 900)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=window_seconds)
+
+    db = SessionLocal()
     try:
-        check_rate_limit("login_lockout", email.lower(), limit=5, window_seconds=900)
-    except HTTPException as e:
-        if e.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
-            # Mask the rate limit error as an auth error to not leak information,
-            # or keep it as 429. Security best practice for lockout is usually a generic message
-            # or explicit locked message. We'll throw 403 Forbidden or 429.
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Account temporarily locked due to multiple failed login attempts. Please try again later.",
-                headers=e.headers,
+        recent = (
+            db.query(LoginFailure.created_at)
+            .filter(
+                LoginFailure.email == email.strip().lower(),
+                LoginFailure.created_at >= cutoff,
             )
-        raise
+            .order_by(LoginFailure.created_at)
+            .limit(threshold)
+            .all()
+        )
+    finally:
+        db.close()
+
+    if len(recent) >= threshold:
+        oldest = recent[0][0]
+        if oldest.tzinfo is None:
+            oldest = oldest.replace(tzinfo=timezone.utc)
+        retry_after = max(1, int((oldest + timedelta(seconds=window_seconds) - now).total_seconds()))
+        inc_counter("rate_limit_rejections_total", {"scope": "login_lockout"})
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account temporarily locked due to multiple failed login attempts. Please try again later.",
+            headers={"Retry-After": str(retry_after)},
+        )

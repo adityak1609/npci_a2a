@@ -41,6 +41,9 @@ pgdata/
 # Logs
 *.log
 
+# Local SQLite state (mock NPCI agent outbox, ad-hoc scratch DBs)
+*.sqlite3
+
 # Received dynamic files
 data/a2a_received/
 

@@ -1,15 +1,17 @@
 """
-main.py — FastAPI application for Mindgate Policy Bot.
+main.py — FastAPI application for the NPCI A2A Partner Platform (bank side).
 
-Endpoints:
-    POST /auth/admin/login → Authenticate an administrator
-    POST /auth/login       → Legacy role-aware login
-    GET  /health         → Health check
-    POST /ingest         → Trigger PDF ingestion (protected)
-    POST /chat           → Ask a question (protected, with chat memory)
-    POST /chat/stream    → Streaming chat via SSE (protected, with chat memory)
-    GET  /chat/history/{session_id} → Retrieve session message history
-    GET  /               → Serves the frontend chat UI
+Wires together the platform's surfaces (see routes/ for the endpoints):
+    routes/a2a_routes.py    → /a2a/external (NPCI JSON-RPC ingress) + /a2a/internal
+    routes/auth_routes.py   → login / session / MFA / logout
+    routes/chat_routes.py   → grounded RAG chat + SSE streaming
+    routes/admin_routes.py  → portal dashboard, changes, updates, admin ops
+    routes/sys_routes.py    → /health, /metrics, /ingest
+    routes/ws_routes.py     → WebSocket updates
+
+This module owns app construction: security-config validation, CORS/CSRF/CSP
+middleware, lifespan (migration gate, startup recovery, periodic cleanup), and
+serving the built SPA.
 """
 
 import os
@@ -98,7 +100,31 @@ client = genai.Client(api_key=google_api_key)
 # FastAPI app with lifespan
 # ---------------------------------------------------------------------------
 _nonce_cleanup_task = None
-EXPECTED_ALEMBIC_REVISION = "20260702_0006_part_a_portal"
+
+# Advisory-lock keys electing a single process for singleton work across
+# Gunicorn workers.  Stable arbitrary 64-bit values; worker.py's retention
+# key (…_0003) shares this keyspace.
+_STARTUP_RECOVERY_LOCK_KEY = 0x4E50_4349_0000_0001
+_MAINTENANCE_LOCK_KEY = 0x4E50_4349_0000_0002
+
+
+def _expected_alembic_head() -> str:
+    """Return the head revision of the checked-in migration chain.
+
+    Derived from the Alembic scripts themselves (never a hand-maintained
+    constant, which drifts) so the production migration gate always compares
+    the database against the code actually being deployed.
+    """
+    from alembic.config import Config as AlembicConfig
+    from alembic.script import ScriptDirectory
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    cfg = AlembicConfig(os.path.join(base_dir, "alembic.ini"))
+    cfg.set_main_option("script_location", os.path.join(base_dir, "alembic"))
+    head = ScriptDirectory.from_config(cfg).get_current_head()
+    if not head:
+        raise EnvironmentError("No Alembic head revision found under alembic/versions.")
+    return head
 
 # ---------------------------------------------------------------------------
 # SQL constants — maintenance queries used by the periodic cleanup task.
@@ -222,6 +248,7 @@ def _assert_database_migrated() -> None:
     """Require Alembic to have applied the expected production schema revision."""
     from sqlalchemy import text
 
+    expected = _expected_alembic_head()
     db = SessionLocal()
     try:
         revision = db.execute(text("SELECT version_num FROM alembic_version")).scalar()
@@ -233,26 +260,35 @@ def _assert_database_migrated() -> None:
     finally:
         db.close()
 
-    if revision != EXPECTED_ALEMBIC_REVISION:
+    if revision != expected:
         raise EnvironmentError(
             f"Database migration revision mismatch: expected "
-            f"{EXPECTED_ALEMBIC_REVISION}, found {revision or 'none'}. "
+            f"{expected}, found {revision or 'none'}. "
             "Run `alembic upgrade head` before starting production."
         )
 
 
 def _cleanup_expired_security_rows() -> None:
-    """Delete expired nonce and WebSocket ticket rows."""
+    """Delete expired nonce and WebSocket ticket rows.
+
+    Advisory-lock guarded: with N Gunicorn workers each running the periodic
+    cleanup loop, only one performs the sweep per interval — the rest skip.
+    """
     from sqlalchemy import text
 
-    db = SessionLocal()
-    try:
-        db.execute(text(_SQL_DELETE_EXPIRED_NONCES))
-        db.execute(text(_SQL_DELETE_EXPIRED_WS_TICKETS))
-        db.execute(text(_SQL_TIMEOUT_STALE_IDEMPOTENCY_KEYS))
-        db.commit()
-    finally:
-        db.close()
+    from database import pg_try_advisory_lock
+
+    with pg_try_advisory_lock(_MAINTENANCE_LOCK_KEY) as acquired:
+        if not acquired:
+            return
+        db = SessionLocal()
+        try:
+            db.execute(text(_SQL_DELETE_EXPIRED_NONCES))
+            db.execute(text(_SQL_DELETE_EXPIRED_WS_TICKETS))
+            db.execute(text(_SQL_TIMEOUT_STALE_IDEMPOTENCY_KEYS))
+            db.commit()
+        finally:
+            db.close()
 
 
 async def _periodic_nonce_cleanup():
@@ -273,29 +309,40 @@ async def lifespan(app: FastAPI):
     """Initialize DB tables, configure threadpool, start file watcher, and recover orphaned jobs."""
     _validate_security_config()
     # Increase the default executor so asyncio.to_thread can service many
-    # concurrent blocking calls (Gemini API, DB queries, etc.)
+    # concurrent blocking calls (Gemini API, DB queries, etc.).  Default to
+    # this process's DB pool ceiling so threads never outnumber the
+    # connections they might each need; override for LLM-heavy workloads
+    # (which hold threads but not DB connections) via env.
+    from database import DB_MAX_OVERFLOW, DB_POOL_SIZE, pg_try_advisory_lock
     loop = asyncio.get_running_loop()
-    # Keep max_workers below DB pool ceiling (pool_size=20 + max_overflow=30 = 50)
-    # to avoid pool-timeout errors when all threads contend for connections.
-    loop.set_default_executor(ThreadPoolExecutor(max_workers=40))
+    max_workers = _env_int("ASYNC_EXECUTOR_MAX_WORKERS", DB_POOL_SIZE + DB_MAX_OVERFLOW)
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=max_workers))
     if _is_production():
         _assert_database_migrated()
     else:
         init_db()
-    await asyncio.to_thread(_cleanup_expired_security_rows)
 
+    # Startup recovery — elect one process via advisory lock.  Claiming is
+    # FOR UPDATE SKIP LOCKED-safe regardless, but N workers racing to flip
+    # orphaned rows back to 'queued' is redundant, and in worker mode this
+    # work belongs to a single process anyway.
+    with pg_try_advisory_lock(_STARTUP_RECOVERY_LOCK_KEY) as acquired:
+        if acquired:
+            await asyncio.to_thread(_cleanup_expired_security_rows)
 
-    # Recover durable received changes before accepting new traffic.
-    from services.a2a_ingestor import recover_orphaned_jobs, recover_received_changes
-    recovered_changes = await recover_received_changes()
-    if recovered_changes:
-        logger.info("Recovered received A2A changes", extra={"recovered": recovered_changes})
+            # Recover durable received changes before accepting new traffic.
+            from services.a2a_ingestor import recover_orphaned_jobs, recover_received_changes
+            recovered_changes = await recover_received_changes()
+            if recovered_changes:
+                logger.info("Recovered received A2A changes", extra={"recovered": recovered_changes})
 
-    # Recover ingestion jobs orphaned by a previous unclean shutdown.
-    recovered = await recover_orphaned_jobs()
-    if recovered:
-        logger.info("Recovered orphaned ingestion jobs", extra={"recovered": recovered})
-        
+            # Recover ingestion jobs orphaned by a previous unclean shutdown.
+            recovered = await recover_orphaned_jobs()
+            if recovered:
+                logger.info("Recovered orphaned ingestion jobs", extra={"recovered": recovered})
+        else:
+            logger.info("Another worker is running startup recovery; skipping in this process.")
+
     global _nonce_cleanup_task
     _nonce_cleanup_task = asyncio.create_task(_periodic_nonce_cleanup())
 
@@ -310,8 +357,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Mindgate Policy Bot",
-    description="RAG-based chatbot for querying Mindgate Solutions' internal policies.",
+    title="NPCI A2A Partner Platform (Bank)",
+    description=(
+        "Bank-side NPCI Agent-to-Agent change-management platform: spec-conformant "
+        "A2A ingress, change lifecycle, partner portal, and a grounded RAG assistant."
+    ),
     version="2.0.0",
     lifespan=lifespan,
 )
@@ -359,13 +409,10 @@ async def security_headers_middleware(request: Request, call_next):
             except ValueError:
                 response = PlainTextResponse("Invalid Content-Length.", status_code=400)
             else:
-                response = None
-            if response is not None:
-                pass
-            elif body_size > max_bytes:
-                response = PlainTextResponse("Request body too large.", status_code=413)
-            else:
-                response = await call_next(request)
+                if body_size > max_bytes:
+                    response = PlainTextResponse("Request body too large.", status_code=413)
+                else:
+                    response = await call_next(request)
         else:
             response = await call_next(request)
 
@@ -410,17 +457,8 @@ async def security_headers_middleware(request: Request, call_next):
     finally:
         request_id_var.reset(request_id_token)
 
-# Gemini model for chat/generation
-GEMINI_MODEL = "gemini-2.5-flash"
-
-# Transient error codes worth retrying
-_RETRYABLE = ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL"]
-MAX_RETRIES = 2
-
-# Number of past messages to include in context window
-CHAT_MEMORY_SIZE = 5  # Last N user+assistant message PAIRS = 10 messages total
-VERIFIED_STREAM_CHUNK_SIZE = 96
-
+# NOTE: Gemini model selection, retry policy, and chat-memory constants live in
+# config.py (env-driven) — do not redefine them here.
 
 # ---------------------------------------------------------------------------
 # Helpers

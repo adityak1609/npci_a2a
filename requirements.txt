@@ -16,6 +16,14 @@ email-validator==2.2.0   # Backs pydantic EmailStr for registration input
 google-genai==2.10.0
 numpy<2.0.0
 
+# Google Agent Development Kit (ADK) — native A2A support (to_a2a, RemoteA2aAgent)
+# for interoperating with NPCI's Google-A2A agent. The [a2a] extra pulls a2a-sdk.
+# NOTE: ADK requires OpenTelemetry >=1.39, so the OTel pins below are bumped from
+# 1.25/0.46b to the matching 1.42.1/0.63b1 set (telemetry.py uses only stable APIs).
+google-adk[a2a]==2.3.0
+# a2a-sdk's JSON-RPC HTTP server (to_a2a → A2AStarletteApplication) needs this.
+sse-starlette==3.4.5
+
 # PDF processing + vision
 PyMuPDF==1.27.2.3
 
@@ -43,16 +51,14 @@ httpx==0.28.1
 # Production distributed rate limiting / worker coordination
 redis==4.6.0
 
-# Async Redis task queue (replaces watchdog)
-arq==0.26.0
-
 # OpenTelemetry for Distributed Tracing
-opentelemetry-api==1.25.0
-opentelemetry-sdk==1.25.0
-opentelemetry-instrumentation-fastapi==0.46b0
-opentelemetry-instrumentation-httpx==0.46b0
-opentelemetry-instrumentation-sqlalchemy==0.46b0
-opentelemetry-exporter-otlp==1.25.0
+# Bumped to the 1.42.1 / 0.63b1 set required by google-adk (see note above).
+opentelemetry-api==1.42.1
+opentelemetry-sdk==1.42.1
+opentelemetry-instrumentation-fastapi==0.63b1
+opentelemetry-instrumentation-httpx==0.63b1
+opentelemetry-instrumentation-sqlalchemy==0.63b1
+opentelemetry-exporter-otlp==1.42.1
 
 # Prometheus metrics (multiprocess-safe for Gunicorn multi-worker deployments)
 prometheus-client==0.21.1

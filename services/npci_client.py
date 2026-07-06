@@ -270,7 +270,10 @@ async def _send_npci_query(
     }
 
     try:
-        data = await post_npci_rpc(rpc_payload)
+        # Route through the transport selector so NPCI_TRANSPORT=a2a sends the
+        # query over Google A2A; legacy resolves back to this module's sender.
+        from services.npci_transport import post_npci_rpc as _post_npci_rpc
+        data = await _post_npci_rpc(rpc_payload)
     except Exception as exc:
         db = SessionLocal()
         try:

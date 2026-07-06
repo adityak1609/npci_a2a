@@ -721,6 +721,102 @@ async def _handle_query(
     }
 
 
+def _extract_doc_text(data: bytes, filename: str) -> str:
+    """Extract text from a pushed document's bytes (PDF via PyMuPDF, else utf-8)."""
+    name = (filename or "").lower()
+    if name.endswith(".pdf") or data[:5] == b"%PDF-":
+        try:
+            import fitz  # PyMuPDF
+            doc = fitz.open(stream=data, filetype="pdf")
+            try:
+                return "\n".join(page.get_text("text") for page in doc)
+            finally:
+                doc.close()
+        except Exception:
+            return ""
+    try:
+        return data.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _change_doc_text(change_id: str | None, max_chars: int = 14000) -> tuple[str, list[str]]:
+    """Best-effort text of the document(s) this mock pushed for a change.
+
+    Reads the most recent change_communication from the outbox, decodes each
+    product_kit[] content_b64, and extracts text. Returns (text, filenames);
+    empty text when nothing usable is found.
+    """
+    if not change_id:
+        return "", []
+    try:
+        with _outbox_connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM outbox WHERE change_id = ? ORDER BY id DESC LIMIT 20",
+                (change_id,),
+            ).fetchall()
+    except Exception:
+        return "", []
+    for r in rows:
+        try:
+            rpc = json.loads(r["payload"])
+        except Exception:
+            continue
+        if rpc.get("method") != "change_communication":
+            continue
+        kit = (((rpc.get("params") or {}).get("payload")) or {}).get("product_kit") or []
+        texts, names = [], []
+        for item in kit:
+            b64 = item.get("content_b64")
+            fn = item.get("filename") or "document"
+            if not b64:
+                continue
+            try:
+                data = base64.b64decode(b64)
+            except Exception:
+                continue
+            txt = _extract_doc_text(data, fn).strip()
+            if txt:
+                texts.append(f"=== {fn} ===\n{txt}")
+                names.append(fn)
+        if texts:
+            return ("\n\n".join(texts))[:max_chars], names
+    return "", []
+
+
+def _ai_clarification(query_text: str, clause_ref: str, doc_text: str, filenames: list[str]):
+    """Generate a grounded NPCI answer via Gemini. Returns (answer, grounded_in) or None."""
+    api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+    if not api_key or not doc_text.strip():
+        return None
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        prompt = (
+            "You are the NPCI clarification desk answering a partner bank's question "
+            "about a change document you (NPCI) published. Answer ONLY from the DOCUMENT "
+            "below, be specific and concise (2-5 sentences), and cite the relevant part. "
+            "If the document does not contain the answer, say so plainly and state what the "
+            "bank should refer to or provide. Do not invent policy.\n\n"
+            f"=== DOCUMENT ===\n{doc_text}\n\n"
+            f"=== BANK QUESTION ===\n{query_text}\n"
+            + (f"(clause in question: {clause_ref})\n" if clause_ref else "")
+            + "\n=== YOUR ANSWER ==="
+        )
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[{"role": "user", "parts": [{"text": prompt}]}],
+        )
+        answer = (resp.text or "").strip()
+        if not answer:
+            return None
+        grounded = ([clause_ref] if clause_ref else []) + list(filenames[:3])
+        return answer, grounded[:4]
+    except Exception as exc:
+        logger.warning("[mock] AI clarification failed; falling back to canned reply: %s", exc)
+        return None
+
+
 async def _auto_reply_clarification(
     change_id: str | None,
     query_id: str,
@@ -729,19 +825,31 @@ async def _auto_reply_clarification(
     clause_ref: str,
     correlation_id: str | None,
 ) -> None:
-    """Background task: send clarification_response to bank after delay (spec §2.3)."""
-    await asyncio.sleep(AUTO_REPLY_DELAY)
-    grounded: list[str] = []
-    if clause_ref:
-        grounded.append(clause_ref)
-    grounded += ["TSD §4.2.3", "BRD §2.1", "NPCI Circular 2024-001"]
+    """Background task: send clarification_response to bank after delay (spec §2.3).
 
-    response_text = (
-        f"[MOCK NPCI AUTO-REPLY] Regarding your query: '{query_text[:120]}'. "
-        "After review, the bank's interpretation is confirmed as per the specification. "
-        "For detailed technical guidance refer to TSD §4.2.3 and BRD §2.1. "
-        "No amendment to the change document is required at this time."
-    )
+    Prefers a Gemini answer grounded in the document this mock pushed for the
+    change; falls back to a canned template if the doc/text/LLM is unavailable.
+    """
+    await asyncio.sleep(AUTO_REPLY_DELAY)
+
+    ai = None
+    doc_text, filenames = await asyncio.to_thread(_change_doc_text, change_id)
+    if doc_text:
+        ai = await asyncio.to_thread(_ai_clarification, query_text, clause_ref, doc_text, filenames)
+
+    if ai:
+        response_text, grounded = ai
+        generation_mode = "ai_assisted"
+    else:
+        grounded = ([clause_ref] if clause_ref else []) + ["TSD §4.2.3", "BRD §2.1", "NPCI Circular 2024-001"]
+        grounded = grounded[:4]
+        generation_mode = "auto"
+        response_text = (
+            f"[MOCK NPCI AUTO-REPLY] Regarding your query: '{query_text[:120]}'. "
+            "After review, the bank's interpretation is confirmed as per the specification. "
+            "For detailed technical guidance refer to TSD §4.2.3 and BRD §2.1. "
+            "No amendment to the change document is required at this time."
+        )
 
     clarification_payload = {
         "change_id": change_id or "",
@@ -749,10 +857,10 @@ async def _auto_reply_clarification(
         "ticket_id": ticket_id,
         "response_text": response_text,
         "interpretation_confirmed": True,
-        "grounded_in": grounded[:4],
+        "grounded_in": grounded,
         "amends_change": False,
         "approver": f"mock_npci_system/{AGENT_ID}",
-        "generation_mode": "auto",
+        "generation_mode": generation_mode,
     }
 
     try:

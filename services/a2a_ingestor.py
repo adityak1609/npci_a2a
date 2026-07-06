@@ -297,10 +297,10 @@ async def process_ingestion_job(job_id: int) -> None:
 # same process and event loop as live chat traffic.  Under a burst of NPCI
 # document pushes, chat latency degrades.
 #
-# Migration path: move ingestion to a real worker queue (arq or Celery + Redis)
-# once inbound NPCI volume is predictable.  The ReceivedDocument + A2AIngestionJob
-# tables already model a durable job queue — the worker just needs to be a
-# separate process reading from those tables instead of asyncio.create_task.
+# Production (A2A_INGESTION_MODE=worker, enforced at startup) therefore moves
+# all ingestion to worker.py: the ReceivedDocument + A2AIngestionJob tables act
+# as a durable Postgres queue that the worker claims from with
+# FOR UPDATE SKIP LOCKED.  Inline mode below exists for dev/demo only.
 # ---------------------------------------------------------------------------
 _active_tasks: dict[int, asyncio.Task] = {}
 
@@ -845,13 +845,11 @@ async def _enqueue_received_change(change_id: str) -> dict:
     if not worker_mode_enabled():
         _schedule_received_change(change_id)
         return {"mode": "inline", "queued": True}
-    try:
-        from services.task_queue import enqueue_received_change_processing
-        await enqueue_received_change_processing(change_id)
-        return {"mode": "arq", "queued": True}
-    except Exception as exc:
-        print(f"[a2a] Failed to enqueue received change {change_id}: {exc}")
-        return {"mode": "arq", "queued": False, "error": str(exc)}
+    # Worker mode: the durable row (status='received') IS the queue.  The
+    # dedicated worker.py process claims it via FOR UPDATE SKIP LOCKED —
+    # there is deliberately no second (Redis) queue to enqueue into, so a
+    # change can never be processed twice by competing consumers.
+    return {"mode": "worker", "queued": True}
 
 
 async def process_received_change(change_id: str) -> dict:
@@ -1071,7 +1069,7 @@ async def _auto_fire_proposal_acknowledged(change_id: str, version: int, force: 
     send_status = "sent"
     send_result = None
     try:
-        from services.npci_client import post_npci_rpc
+        from services.npci_transport import post_npci_rpc
         send_result = await post_npci_rpc(rpc_payload)
     except Exception as exc:
         send_status = "send_failed"
@@ -1155,7 +1153,7 @@ async def _auto_fire_change_acknowledgement(change_id: str, version: int, force:
     send_status = "sent"
     send_result = None
     try:
-        from services.npci_client import post_npci_rpc
+        from services.npci_transport import post_npci_rpc
         send_result = await post_npci_rpc(rpc_payload)
     except Exception as exc:
         send_status = "send_failed"

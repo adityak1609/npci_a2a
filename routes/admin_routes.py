@@ -810,7 +810,56 @@ def portal_dashboard(
     shared_title = {c.change_id: (c.title or c.change_id) for c in shared_changes}
     shared_ids = list(shared_title.keys())
     common_updates: list[dict] = []
+
+    # Document entries first, and note which changes have documents. A single
+    # NPCI push creates both a change record and its document; the document is
+    # the actionable entry (it has a download), so we surface that and suppress
+    # the redundant "New change published" notice when documents exist.
+    changes_with_docs: set[str] = set()
+    if shared_ids:
+        docs = (
+            db.query(ReceivedDocument)
+            .filter(ReceivedDocument.change_id.in_(shared_ids))
+            .order_by(ReceivedDocument.created_at.desc())
+            .limit(200)
+            .all()
+        )
+        # Batch-fetch summaries so the update can show what the document says,
+        # not just its filename.
+        doc_ids = [d.id for d in docs]
+        summary_of: dict[int, str] = {}
+        if doc_ids:
+            for s in db.query(DocumentSummary).filter(DocumentSummary.document_id.in_(doc_ids)).all():
+                if s.document_id is not None and s.summary:
+                    summary_of[s.document_id] = s.summary
+        for d in docs:
+            changes_with_docs.add(d.change_id)
+            summary = summary_of.get(d.id)
+            if summary:
+                detail_full = f"{d.filename}\n\nSummary\n{summary}"
+            elif d.status != "ready":
+                detail_full = f"{d.filename}\n\nSummary is still being generated (document status: {d.status})."
+            else:
+                detail_full = f"{d.filename}\n\nNo summary available for this document."
+            common_updates.append({
+                "kind": "document",
+                "change_id": d.change_id,
+                "change_title": shared_title.get(d.change_id, d.change_id),
+                "ref": str(d.id),
+                "status": d.status,
+                "npci_responded": True,
+                "detail": f"New document from NPCI: {d.filename}",
+                "detail_full": detail_full,
+                "at": d.created_at,
+                "download_id": d.id,
+            })
+
+    # Only announce a change on its own when it has no documents yet (e.g. a
+    # change communicated ahead of its product kit). Otherwise the document
+    # entries above already represent this push.
     for c in shared_changes:
+        if c.change_id in changes_with_docs:
+            continue
         common_updates.append({
             "kind": "change_published",
             "change_id": c.change_id,
@@ -822,25 +871,6 @@ def portal_dashboard(
             "at": c.created_at,
             "download_id": None,
         })
-    if shared_ids:
-        for d in (
-            db.query(ReceivedDocument)
-            .filter(ReceivedDocument.change_id.in_(shared_ids))
-            .order_by(ReceivedDocument.created_at.desc())
-            .limit(200)
-            .all()
-        ):
-            common_updates.append({
-                "kind": "document",
-                "change_id": d.change_id,
-                "change_title": shared_title.get(d.change_id, d.change_id),
-                "ref": str(d.id),
-                "status": d.status,
-                "npci_responded": True,
-                "detail": f"New document from NPCI: {d.filename}",
-                "at": d.created_at,
-                "download_id": d.id,
-            })
     common_updates = _finalize(common_updates)[:100]
 
     return {
@@ -1004,7 +1034,7 @@ async def put_settings(
 @router.post("/admin/settings/test-connection", tags=["Admin - Settings"])
 async def settings_test_connection(current_admin: User = Depends(get_current_admin)):
     """Send an echo to NPCI using the current settings; report reachability."""
-    from services.npci_client import post_npci_rpc
+    from services.npci_transport import post_npci_rpc
     from services.npci_outbound import build_outbound_envelope
     envelope = build_outbound_envelope("echo", {"ping": "ping"})
     rpc_payload = {"jsonrpc": "2.0", "id": envelope["message_id"], "method": "echo", "params": envelope}

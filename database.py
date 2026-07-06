@@ -35,7 +35,7 @@ from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from pgvector.sqlalchemy import Vector
 import uuid
-from config import env_bool
+from config import env_bool, env_int
 from embedding_config import embedding_dim
 from secrets_loader import load_secret_files
 
@@ -47,12 +47,21 @@ load_secret_files()
 # ---------------------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/mindgate_db")
 
+# Per-PROCESS pool sizing.  The effective ceiling against Postgres is
+# (DB_POOL_SIZE + DB_MAX_OVERFLOW) × number of processes — every Gunicorn API
+# worker plus the ingestion worker holds its own pool.  The defaults
+# (5 + 10 = 15 per process; 5 processes ≈ 75 connections) stay inside a stock
+# Postgres max_connections=100.  Raise these only together with the server's
+# max_connections, or put PgBouncer in front.
+DB_POOL_SIZE = env_int("DB_POOL_SIZE", 5)
+DB_MAX_OVERFLOW = env_int("DB_MAX_OVERFLOW", 10)
+
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
     echo=False,
-    pool_size=20,          # Persistent connections (default was 5)
-    max_overflow=30,       # Burst to 50 total under load (default was 10)
+    pool_size=DB_POOL_SIZE,
+    max_overflow=DB_MAX_OVERFLOW,
     pool_timeout=30,       # Wait up to 30s for a free connection
     pool_recycle=1800,     # Recycle connections every 30 min (avoid stale)
     # Kill runaway queries (e.g. pgvector ANN search under load) before they
@@ -64,6 +73,44 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
+
+
+# ---------------------------------------------------------------------------
+# Cross-process coordination
+# ---------------------------------------------------------------------------
+from contextlib import contextmanager  # noqa: E402  (kept near its only use)
+
+
+@contextmanager
+def pg_try_advisory_lock(key: int):
+    """Yield True while holding a Postgres session advisory lock, False if
+    another process already holds it.
+
+    Used to elect a single process for singleton work (startup recovery,
+    periodic maintenance, retention) across Gunicorn workers.  Fails OPEN:
+    if the database is unreachable the caller proceeds as if it won the
+    election — the guarded work is idempotent/SKIP LOCKED-safe and will
+    surface its own connectivity errors.
+    """
+    from sqlalchemy import text
+
+    try:
+        conn = engine.connect()
+    except Exception:
+        yield True
+        return
+    acquired = False
+    try:
+        acquired = bool(
+            conn.execute(text("SELECT pg_try_advisory_lock(:key)"), {"key": key}).scalar()
+        )
+        yield acquired
+    finally:
+        try:
+            if acquired:
+                conn.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +135,26 @@ class User(Base):
 
     sessions = relationship("ChatSession", back_populates="user", cascade="all, delete-orphan")
     feedback = relationship("MessageFeedback", back_populates="user", cascade="all, delete-orphan")
+
+
+class LoginFailure(Base):
+    """One failed login attempt, keyed by (normalized) email.
+
+    Backs the account-lockout policy: N failures inside the window lock the
+    account for the remainder of the window.  Stored in Postgres — not Redis
+    or process memory — so the lockout is shared across workers and survives
+    Redis outages instead of failing open.  Rows are short-lived; the daily
+    retention job purges anything older than a day.
+    """
+    __tablename__ = "login_failures"
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String(255), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        Index("ix_login_failures_email_created", "email", "created_at"),
+    )
 
 
 class ChatSession(Base):

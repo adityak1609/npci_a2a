@@ -31,7 +31,7 @@ from a2a_models import (
 )
 from a2a_state import advance_change_state
 from database import A2ABlocker, A2AChange, A2ACounterProposal, A2AMilestone, SessionLocal
-from services.npci_client import post_npci_rpc
+from services.npci_transport import post_npci_rpc
 
 _AGENT_ID = "mindgate_a2a_agent"
 

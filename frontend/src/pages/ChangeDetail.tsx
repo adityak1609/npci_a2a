@@ -6,7 +6,7 @@ import { Card, Button, Input, Textarea, Label, Badge, Banner } from "../componen
 
 interface Detail {
   change: { change_id: string; title: string; state: string; bucket: string; version: number | null; blocked: boolean; blocked_reason: string | null };
-  documents: { id: number; filename: string; doc_type: string | null; status: string; version: number | null }[];
+  documents: { id: number; filename: string; doc_type: string | null; status: string; version: number | null; summary: string | null }[];
   counter_proposals: { counter_proposal_id: string; status: string; decided: boolean }[];
   blockers: { blocker_id: string; type: string | null; severity: string | null; status: string; resolution: string | null }[];
   milestones: { milestone: string; state: string; eta: string | null }[];
@@ -119,12 +119,13 @@ export default function ChangeDetail() {
       <div className="grid grid-cols-2 gap-6">
         <Section title="Documents & attachments from NPCI">
           {detail.documents.length === 0 ? <Empty /> : detail.documents.map((d) => (
-            <Row
-              key={d.id}
-              left={d.filename}
-              sub={d.doc_type ?? undefined}
-              right={
-                <div className="flex items-center gap-3">
+            <div key={d.id} className="border-b border-slate-50 pb-3 last:border-0">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-sm text-slate-700">{d.filename}</div>
+                  {d.doc_type && <div className="text-xs text-slate-400">{d.doc_type}</div>}
+                </div>
+                <div className="flex shrink-0 items-center gap-3">
                   <a
                     href={`/documents/${d.id}/download`}
                     download
@@ -134,8 +135,22 @@ export default function ChangeDetail() {
                   </a>
                   <Badge value={d.status} />
                 </div>
-              }
-            />
+              </div>
+              <div className="mt-2">
+                <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-400">Summary</div>
+                {d.summary ? (
+                  <div className="max-h-72 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs leading-relaxed text-slate-600">
+                    {d.summary}
+                  </div>
+                ) : (
+                  <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-400">
+                    {d.status === "ready"
+                      ? "No summary available for this document."
+                      : `Summary is being generated (status: ${d.status})…`}
+                  </div>
+                )}
+              </div>
+            </div>
           ))}
         </Section>
         <Section title="Milestones">
