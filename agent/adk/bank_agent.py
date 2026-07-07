@@ -11,9 +11,10 @@ there is no LLM in this path. The agent:
        so idempotency, task_type handlers, state advancement, audit, and async
        ingestion are reused verbatim.
 
-Transport-level auth (mTLS/CIDR/HMAC — layers 1-4) belongs to the legacy custom
-endpoint and is not run here; for the bundled mock that is acceptable, and the
-mapping to A2A ``securitySchemes`` for the real NPCI agent is a follow-up.
+Transport-level auth (mTLS/CIDR/HMAC/JWT — layers 1-4) is enforced at the ASGI
+boundary by ``agent/adk/transport_auth.py`` when ``A2A_ADK_TRANSPORT_AUTH`` is
+on (production); the spec stacks the NPCI HMAC envelope + JWT bearer on top of
+the Google A2A SDK transport, same as the legacy endpoint.
 """
 
 from __future__ import annotations
@@ -25,8 +26,17 @@ from google.adk.agents import BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event
 
-from a2a_auth import A2AAuthContext, A2AAuthError, check_ownership, check_state_transition
+from a2a_auth import (
+    A2AAuthContext,
+    A2AAuthError,
+    check_agent_identity,
+    check_ownership,
+    check_partner_binding_sub,
+    check_partner_status,
+    check_state_transition,
+)
 from agent.adk.message_mapping import genai_parts_to_envelope, result_to_genai_content
+from agent.adk.transport_auth import adk_principal
 from agent.external_dispatcher import (
     NotImplementedTaskError,
     PayloadValidationError,
@@ -60,19 +70,32 @@ class BankA2AProtocolAgent(BaseAgent):
         """Run preserved authz, then the shared external dispatcher."""
         db = SessionLocal()
         try:
-            # Preserved business-authz (spec §4.1 layers 6-7). Layers 1-5 (mTLS,
-            # CIDR, HMAC, JWT, partner status) are transport-side and skipped on
-            # the ADK path for the trusted local mock.
+            # Identity established at the transport boundary (transport_auth.py:
+            # spec §4.1 layers 1-4). None when A2A_ADK_TRANSPORT_AUTH is off (the
+            # trusted local-mock default), in which case the sub-based binding is
+            # a no-op.
+            principal = adk_principal.get()
+            jwt_sub = principal.jwt_sub if principal else None
+            caller_ip = principal.caller_ip if principal else "a2a-adk"
+
+            # Message-level authz (spec §4.1 layers 5-8). Layers 1-4 (mTLS, CIDR,
+            # HMAC envelope, JWT) are enforced at the transport boundary by
+            # agent/adk/transport_auth.py — the NPCI protocol layers ride on top
+            # of the Google A2A SDK transport, per the spec's stack.
             try:
-                check_ownership(envelope, envelope.from_, db)
-                check_state_transition(envelope, db)
+                check_partner_status(envelope.from_, db)        # L5a
+                check_partner_binding_sub(envelope, jwt_sub)     # L5b
+                check_ownership(envelope, envelope.from_, db)    # L6
+                check_state_transition(envelope, db)             # L7
+                check_agent_identity(envelope)                   # L8
             except A2AAuthError as exc:
+                self._audit_rejection(db, caller_ip, exc)
                 return {"error": exc.error_code, "detail": exc.detail}
 
             try:
                 ctx = A2AAuthContext(
-                    caller_ip="a2a-adk",
-                    jwt_sub=None,
+                    caller_ip=caller_ip,
+                    jwt_sub=jwt_sub,
                     partner_id=envelope.from_,
                     agent_id=envelope.agent_id,
                     agent_run_id=envelope.agent_run_id,
@@ -93,6 +116,26 @@ class BankA2AProtocolAgent(BaseAgent):
                 return {"error": "internal_error", "detail": "Internal error"}
         finally:
             db.close()
+
+    @staticmethod
+    def _audit_rejection(db, caller_ip: str, exc: A2AAuthError) -> None:
+        """Log an L5-L8 authz rejection to a2a_messages (parity with the legacy
+        endpoint). Auditing must never mask the real rejection."""
+        try:
+            from a2a_audit import log_a2a_rejection
+            from metrics import inc_counter
+
+            inc_counter("a2a_auth_rejections_total", {"error_code": exc.error_code})
+            log_a2a_rejection(
+                db,
+                raw_body=b"",
+                caller_ip=caller_ip,
+                error_code=exc.error_code,
+                detail=exc.detail,
+                http_status=exc.http_status,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to audit ADK message-authz rejection")
 
     def _event(self, ctx: InvocationContext, result: dict) -> Event:
         return Event(

@@ -2,7 +2,7 @@
 
 *Bank-side implementation of the NPCI Agent-to-Agent (A2A) change-management workflow.*
 
-This document explains **what the platform is built from, why each technology was chosen, how the 8-layer authentication stack works, and how the A2A protocol itself works** — including the common point of confusion: *is A2A the Google library?* (Short answer: **no** — see [§5](#5-how-a2a-actually-works).)
+This document explains **what the platform is built from, why each technology was chosen, how the 8-layer authentication stack works, and how the A2A protocol itself works** — including the common point of confusion: *is A2A the Google library?* (Short answer: it began as NPCI's **custom** JSON-RPC protocol, and a **Google A2A (ADK)** transport has since been added alongside it — the two run in parallel and are flag-selectable; see [§5](#5-how-a2a-actually-works).)
 
 It is a companion to the module-level `docs/ARCHITECTURE.md` and `docs/TECHNICAL_DOCUMENTATION.md`. Where those describe *what each file does*, this one focuses on *the reasoning behind the design*.
 
@@ -51,6 +51,15 @@ There are two distinct classes of caller, and therefore two distinct authenticat
 
 **Why async matters here specifically:** the ingestion pipeline (OCR → chunk → embed → summarize) and live chat share the same event loop in dev. Blocking calls (PyMuPDF, Gemini, Postgres) are pushed to a thread pool via `asyncio.to_thread`, and the default executor is sized to the DB pool ceiling (`main.py` lifespan) so threads never outnumber the connections they need.
 
+#### 2.1a A2A transport libraries
+
+| Technology | Version | Why |
+|------------|---------|-----|
+| **`google-adk[a2a]`** | 2.3.0 | Google's **Agent Development Kit**, used *only* for the optional Google-A2A transport ([§5.6](#56-the-google-a2a-adk-transport)): `to_a2a()` exposes the bank's deterministic agent as an A2A server with an auto-generated agent card. Added to interoperate with the **real NPCI agent, which speaks Google A2A**. The `[a2a]` extra pulls **`a2a-sdk`** (the A2A client + JSON-RPC server). ADK's OTel floor (≥1.39) is why the OpenTelemetry pins in §2.6 are bumped. |
+| **`a2a-sdk`** (via ADK extra) | — | The `a2a.client` (`ClientFactory`, `A2ACardResolver`) and `a2a.types` (`Message`, `TextPart`, `FilePart`) used by `agent/adk/a2a_client.py` and the message mapper. Chosen over ADK's `RemoteA2aAgent` (built for LLM sub-agent delegation) for deterministic, file-bearing protocol sends. |
+
+> This is a **separate concern from Gemini.** `google-genai` (§2.2) is the LLM SDK; `google-adk`/`a2a-sdk` here are a wire transport. Both happen to be Google packages — that is the *only* thing they share.
+
 ### 2.2 AI / RAG layer
 
 | Technology | Why |
@@ -59,7 +68,7 @@ There are two distinct classes of caller, and therefore two distinct authenticat
 | **`gemini-embedding-001`** | Produces the vectors stored in pgvector for semantic retrieval. Keeping embeddings and generation in one provider avoids a second vendor integration and keeps the embedding space consistent between ingest-time and query-time. |
 | **PyMuPDF (`fitz`)** | 1.27 | Fast, dependency-light PDF text extraction for inbound document kits. Images fall through to a Gemini vision path (`services/a2a_vision.py`). |
 
-> ⚠️ **Important:** the `from google import genai` imports across the codebase are the **Gemini SDK for the LLM** — they have **nothing to do with the A2A protocol**. A2A here is a hand-written implementation of NPCI's spec, not a Google product. See [§5.1](#51-is-a2a-the-google-library-no).
+> ⚠️ **Important:** the `from google import genai` imports across the codebase are the **Gemini SDK for the LLM** — they have **nothing to do with the A2A protocol**. Don't confuse this with **`google-adk` / `a2a-sdk`** (§2.1a), which are a *separate, optional* Google-A2A transport. A2A's core (envelope, state machine, dispatch, auth) is a hand-written implementation of NPCI's spec; Google's ADK only provides an alternate wire for it. See [§5.1](#51-two-transports-for-one-protocol).
 
 ### 2.3 Data + persistence
 
@@ -211,18 +220,22 @@ Each layer answers a **different question** and can be **configured, monitored, 
 
 The ordering is deliberate: **cheapest and most decisive checks first** (network/transport), expensive crypto next, and business/authorization logic (which needs the parsed envelope and DB lookups) last.
 
+> **Same eight layers on the Google-A2A transport.** This section describes the layers as they run on the legacy `/a2a/external` endpoint. When the ADK transport is used, the *identical* eight layers apply — L1–L4 move to an ASGI middleware and L5–L8 run inside the ADK agent, but they reuse these same `a2a_auth` helpers. See [§5.6](#56-the-google-a2a-adk-transport).
+
 ---
 
 ## 5. How A2A actually works
 
-### 5.1 Is A2A the Google library? **No.**
+### 5.1 Two transports for one protocol
 
-This is the single most important clarification. **A2A here is a bespoke implementation of NPCI's own "Unified AgentNxt A2A Protocol Specification v1.0"** — see the module docstring in `a2a_models.py`. It is:
+A2A on this platform now has **two coexisting wire transports**, selectable per deployment. Understanding the distinction is the single most important clarification:
 
-- **A custom protocol**, not a third-party SDK. There is no `a2a` package, no Google "Agent2Agent" library, and no framework doing the protocol work. The envelope, task types, state machine, auth, idempotency, and dispatch are all hand-written in this repo (`a2a_models.py`, `a2a_auth.py`, `a2a_state.py`, `agent/external_dispatcher.py`).
-- The **`google` imports are for Gemini only** — the LLM used by the RAG assistant, embeddings, summaries, and the guardrail classifier (`google-genai` SDK). They are unrelated to agent-to-agent messaging.
+- **`legacy` (default) — NPCI's custom protocol.** A bespoke implementation of NPCI's own *"Unified AgentNxt A2A Protocol Specification v1.0"* (see the module docstring in `a2a_models.py`): plain **JSON-RPC 2.0 over HTTPS**, secured by the custom **8-layer** stack ([§4](#4-the-8-layer-authentication-stack)). The envelope, task types, state machine, auth, idempotency, and dispatch are all hand-written in this repo (`a2a_models.py`, `a2a_auth.py`, `a2a_state.py`, `agent/external_dispatcher.py`). **Sections 5.2–5.5 describe this path.**
+- **`a2a` — Google A2A via the ADK.** An **additive** transport built on Google's **Agent Development Kit** (`google-adk[a2a]`, which pulls the `a2a-sdk` client). The NPCI spec's reference implementation *aligns with Google's A2A ecosystem*: the spec's transport stack is `A2A SDK (Google A2A ADK) → JSON-RPC 2.0 → HMAC envelope → JWT bearer → TLS/mTLS → nginx` — i.e. the Google SDK is the **transport**, and NPCI's protocol layers (the envelope, HMAC, JWT, all 8 auth layers) ride **on top of it**. Both transports are JSON-RPC 2.0 on the wire; the difference is the **method vocabulary** — the legacy path overloads the JSON-RPC `method` to carry the `task_type`, whereas Google A2A uses the *standard* A2A methods (`message/send`, …) and carries the **same `A2AEnvelope`** inside the message parts. It reuses the existing dispatcher and business logic verbatim. **Section 5.6 describes this path.**
 
-> If someone reads `from google import genai` and assumes "A2A = a Google thing," that is a misread. The transport is plain **JSON-RPC 2.0 over HTTPS**, secured by the custom 8-layer stack.
+Both are **flag-selectable and run in parallel** — outbound transport is chosen by the `NPCI_TRANSPORT` setting (`services/npci_transport.py`); on the inbound side the legacy `POST /a2a/external` endpoint (`main.py`) and the new ADK server (`a2a_adk_server.py`) coexist as **separate processes**. Nothing about the custom endpoint or the 8-layer stack changed when the ADK path was added — it is purely additive, per the parallel-run migration strategy.
+
+> **Still not "just a Google thing":** two unrelated `google` dependencies live in this repo and are easy to conflate. **`google-genai`** (`from google import genai`) is for **Gemini only** — the LLM behind the RAG assistant, embeddings, summaries, and the guardrail classifier — and has nothing to do with agent-to-agent messaging. **`google-adk` / `a2a-sdk`** are the (optional) A2A *transport*. Reading `from google import genai` and concluding "A2A = a Google thing" conflates the two.
 
 ### 5.2 The wire format: JSON-RPC 2.0 + an A2A envelope
 
@@ -269,12 +282,49 @@ After auth, `agent/external_dispatcher.py` routes on `task_type` through the `EX
 
 ### 5.5 Outbound (Bank → NPCI)
 
-The Bank is also a *client*. `services/npci_client.py` sends JSON-RPC to NPCI over **httpx** with:
-- **Outbound HMAC** — it signs its own requests with the same `{ts}.{nonce}.{sha256(body)}` scheme (so NPCI can run the mirror-image verification).
-- **mTLS client cert** (`NPCI_CLIENT_CERT_FILE`/`KEY_FILE`, required in production).
-- **Retry with backoff** (3 attempts, 1/2/4 s) and per-attempt timeouts.
+The Bank is also a *client*. Every outbound send goes through **one transport selector** — `services/npci_transport.py` exposes `post_npci_rpc`, and callers (`services/a2a_ingestor.py` auto-fires, `services/npci_outbound.py` senders) import it from there so switching transports is a **single config flip** (`NPCI_TRANSPORT`) with no code change:
+
+- **`legacy` (default) → `services/npci_client.py`** sends JSON-RPC to NPCI over **httpx** with:
+  - **Outbound HMAC** — it signs its own requests with the same `{ts}.{nonce}.{sha256(body)}` scheme (so NPCI can run the mirror-image verification).
+  - **mTLS client cert** (`NPCI_CLIENT_CERT_FILE`/`KEY_FILE`, required in production).
+  - **Retry with backoff** (3 attempts, 1/2/4 s) and per-attempt timeouts.
+- **`a2a` → `services/npci_a2a_client.py`** forwards the same envelope over Google A2A (see [§5.6](#56-the-google-a2a-adk-transport)). The legacy JSON-RPC `params` object *is* the envelope, so it is sent as-is and NPCI's reply is re-wrapped in a JSON-RPC-shaped dict — existing callers are unaware which transport ran.
 
 Several outbound messages are **auto-fired**: receiving a `change_communication` triggers `proposal_acknowledged`, and successful ingestion triggers `change_acknowledgement`, both idempotent (`services/a2a_ingestor.py`).
+
+### 5.6 The Google A2A (ADK) transport
+
+Added so the platform can interoperate with the **real NPCI agent, which speaks Google's A2A protocol**. It reuses the entire business core — envelope model, dispatcher, idempotency, state machine, audit — and only swaps the *wire*.
+
+**Inbound (NPCI → Bank), `a2a_adk_server.py`:** a standalone Google-A2A server, run as its **own process** (`uvicorn a2a_adk_server:a2a_app`, default port 8002) to avoid nesting ASGI lifespans with `main.py`'s heavy startup. `google.adk...to_a2a()` wraps the bank's root agent and **auto-generates the agent card** at `/.well-known/agent-card.json` (the ADK equivalent of an OpenAPI/`securitySchemes` descriptor).
+
+- The root agent (`agent/adk/bank_agent.py`) is a **deterministic `BaseAgent`, not an `LlmAgent`** — the change lifecycle is compliance-critical, so **there is no LLM in this path**. On each inbound message it:
+  1. reconstructs the `A2AEnvelope` from the message parts,
+  2. **re-runs the business-authz layers** — partner status + binding (`check_partner_status`, `check_partner_binding_sub`), `check_ownership`, `check_state_transition`, and `check_agent_identity` (spec §4.1 **layers 5–8**) via the existing `a2a_auth` helpers, then
+  3. delegates to the **unchanged** `agent/external_dispatcher.dispatch_external`, so idempotency, task_type handlers, state advancement, audit, and async ingestion are reused verbatim.
+- Handler results and errors are returned as structured JSON — a malformed message or handler failure becomes a typed error object (`invalid_message`, `not_implemented`, …), never a raw 500 over A2A. Authz rejections (L5–L8) are also written to the `a2a_messages` audit table, matching the legacy endpoint.
+
+**Transport auth on the ADK path (`agent/adk/transport_auth.py`).** A pure-ASGI middleware enforces spec §4.1 **layers 1–4** at the boundary — the insertion point the agent can't reach (a `BaseAgent` only sees message parts, never the HTTP request). Per the spec's transport stack, the NPCI protocol layers ride **on top of** the Google A2A SDK, so it runs the **same four checks as the legacy endpoint, with the same helpers**:
+
+| Layer | On the ADK path |
+|-------|-----------------|
+| L1 mTLS, L2 CIDR | reused (`check_mtls`, `check_cidr`) — put the server behind the same reverse proxy |
+| **L3 HMAC envelope** | reused (`verify_hmac`) — the middleware buffers the **raw body bytes** (with the legacy size cap), verifies the signature/timestamp/nonce over them *before* the a2a-sdk parses the message, then replays the body downstream |
+| L4 JWT (+revocation) | reused (`verify_jwt_session`); the bearer requirement is **advertised in the agent card's `securitySchemes`** |
+| L5–L8 | run inside the agent (above), using the subject the middleware publishes on a contextvar |
+
+The middleware is gated by **`A2A_ADK_TRANSPORT_AUTH`** (default **off** for local dev; set **on** in production). Card discovery (`GET /.well-known/agent-card.json`) stays open so clients can read the scheme they must satisfy; only RPC sends (`POST`) are guarded. Rejections return an A2A/JSON-RPC error and are audited to `a2a_messages`.
+
+> **Remaining follow-up:** the mTLS-fingerprint half of partner-binding (L5) is enforced at the proxy on this path rather than in-process, and per-agent/per-task authorization (L8) is still the same open "any known agent" check as the legacy endpoint. Onboarding the real NPCI agent needs its issued bearer token wired into `A2A_JWT_PARTNER_MAP` and the shared HMAC secret exchanged.
+
+**Outbound (Bank → NPCI), `agent/adk/a2a_client.py`:** a reusable client (used by both the Bank and the mock NPCI agent) that resolves the remote **agent card**, then sends the envelope with the `a2a-sdk` `ClientFactory` — deliberately *not* ADK's `RemoteA2aAgent`, which is built for LLM sub-agent delegation and is an awkward fit for deterministic, file-bearing protocol sends. Every send is signed by an `httpx.Auth` hook (`NpciEnvelopeAuth`) that attaches the **HMAC envelope headers** (`X-NPCI-Timestamp/Nonce/Signature`) and the **bearer key** — the same header contract as the legacy `services/npci_client.py`, so NPCI runs the mirror-image verification (L3 + L4 on the outbound side).
+
+**Message mapping (`agent/adk/message_mapping.py`)** — the bank↔NPCI Google-A2A contract is kept simple and robust, avoiding ADK's internal `<a2a_datapart_json>` encoding:
+
+- the envelope travels as **one `TextPart`** of JSON (the same shape `A2AEnvelope` already validates), and
+- for `change_communication`, **each `product_kit` document becomes its own `FilePart(FileWithBytes)`** — large binaries travel as real file parts rather than base64 stuffed into the text. The `content_b64` is peeled out on send and **re-injected by filename** on receive, so the existing ingestion handler is reused unchanged.
+
+A **mock NPCI ADK agent** (`mock_npci_agent/adk_agent.py`) exposes the same Google-A2A surface for local end-to-end testing over this transport.
 
 ---
 

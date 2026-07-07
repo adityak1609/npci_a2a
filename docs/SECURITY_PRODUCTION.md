@@ -15,6 +15,7 @@ This application is configured to fail closed for NPCI-facing A2A traffic.
 - Configure `A2A_CIDR_ALLOWLIST` and `A2A_MTLS_FINGERPRINTS` for the NPCI endpoints used in production.
 - Configure `A2A_MTLS_PARTNER_MAP` and `A2A_JWT_PARTNER_MAP` so the claimed A2A `from` partner is bound to the presented certificate/JWT subject. mTLS map keys may be the proxy-native fingerprint or the SHA-256 fingerprint computed from `X-SSL-Client-Cert`.
 - Configure `NPCI_AGENT_URL`, `NPCI_CLIENT_CERT_FILE`, and `NPCI_CLIENT_KEY_FILE`; outbound `proposal_acknowledged` messages and queries are signed and sent over mTLS instead of only logged locally.
+- If the Google-A2A transport is used (`NPCI_TRANSPORT=a2a` or the ADK server `a2a_adk_server.py` is reachable by NPCI), set `A2A_ADK_TRANSPORT_AUTH=true` and place the ADK server behind the same mTLS-terminating reverse proxy as `/a2a/external`. The ADK path enforces the same spec §4.1 layers: mTLS/CIDR/HMAC/JWT in `agent/adk/transport_auth.py`, partner/ownership/state/agent checks in the agent. Never expose the ADK server with the flag off.
 - Keep `EXTERNAL_AI_DATA_PROCESSING_APPROVED=false` until NPCI data handling, residency, and vendor terms explicitly permit sending policy/payment data to Gemini.
   - **Data Residency Policy (Override permitted)**: NPCI data must remain within the geographic boundaries specified by the compliance agreement.
   - **Vendor Controls & Redaction**: All sensitive user PII must be redacted before being sent to the Gemini API. Vendor terms dictate that Google will NOT use the sent data for model training.
@@ -27,6 +28,7 @@ This application is configured to fail closed for NPCI-facing A2A traffic.
 - HMAC timestamp, nonce format, signature format, replay storage, and scheduled nonce cleanup are enforced.
 - A2A request bodies are capped before buffering, and invalid HMAC requests are rejected before nonce rows are written.
 - A2A external credentials are bound to partner identities before state or document handlers run; Nginx forwards the escaped client certificate so the app can compute a SHA-256 fingerprint consistently.
+- The Google-A2A (ADK) server applies the same auth chain when `A2A_ADK_TRANSPORT_AUTH=true`: raw-body HMAC verification before message parsing, JWT + revocation, and in-agent partner/ownership/state/agent checks; outbound ADK sends are HMAC-signed and bearer-authenticated (`NpciEnvelopeAuth`), and rejections are written to the same `a2a_messages` audit chain.
 - Inbound A2A transport and business idempotency keys are claimed before handler side effects, preventing concurrent retries from double-processing the same message.
 - Known but unimplemented NPCI task types return explicit JSON-RPC errors and audit entries instead of ACKs.
 - WebSocket subscriptions use short-lived single-use tickets instead of long-lived JWT/API key query parameters.

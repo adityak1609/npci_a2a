@@ -36,6 +36,13 @@ CORS_ORIGINS=https://<admin-console-host>
 METRICS_BEARER_TOKEN=<random-prometheus-scrape-token>
 CHAT_MAX_REQUEST_BYTES=65536
 SHUTDOWN_GRACE_SECONDS=30
+
+# Google A2A (ADK) transport — only when cutting over from the legacy wire
+NPCI_TRANSPORT=legacy
+NPCI_A2A_AGENT_CARD_URL=https://<npci-agent-host>/.well-known/agent-card.json
+BANK_A2A_HOST=<bank-a2a-host>
+BANK_A2A_PORT=8002
+A2A_ADK_TRANSPORT_AUTH=true
 ```
 
 Secret-manager file mounts are also supported with `SECRET_KEY_FILE`,
@@ -58,6 +65,12 @@ deployment pipeline or secret manager.
 - `reverse-proxy`: Nginx TLS/mTLS termination
 - `prometheus`: authenticated scraping and alert rule evaluation
 - `alertmanager`: alert routing
+
+When the Google-A2A transport is enabled (`NPCI_TRANSPORT=a2a`), additionally run
+`uvicorn a2a_adk_server:a2a_app --port 8002` as its own process, bind it to a
+private interface, route it through the same mTLS-terminating Nginx as
+`/a2a/external`, and keep `A2A_ADK_TRANSPORT_AUTH=true`. Rollback is
+`NPCI_TRANSPORT=legacy` — a config flip, no redeploy.
 
 Before starting the stack, provide:
 

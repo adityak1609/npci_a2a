@@ -491,6 +491,40 @@ def check_credential_binding(
         )
 
 
+def check_partner_binding_sub(
+    envelope: A2AEnvelope,
+    jwt_sub: Optional[str],
+) -> None:
+    """Bind the claimed partner to the JWT subject **without an HTTP request**.
+
+    The Google-A2A (ADK) path terminates inside an ADK agent that only receives
+    message parts, never the raw request, so it cannot inspect mTLS fingerprints.
+    This enforces the *JWT half* of :func:`check_credential_binding` (spec §4.1
+    Layer 5); the mTLS-fingerprint half is enforced at the transport boundary
+    (reverse proxy / ``agent/adk/transport_auth.py``) on that path.
+    """
+    if not jwt_sub:
+        return  # No authenticated subject (JWT not required) — nothing to bind.
+
+    partner_id = (envelope.from_ or "").strip().lower()
+    agent_id = (envelope.agent_id or "").strip().lower()
+    jwt_map = _env_mapping("A2A_JWT_PARTNER_MAP")
+    jwt_key = jwt_sub.strip().lower()
+    if jwt_map:
+        if jwt_map.get(jwt_key) != partner_id:
+            raise A2AAuthError(
+                A2AErrorCode.PARTNER_MISMATCH,
+                "JWT subject is not bound to the claimed A2A partner.",
+                http_status=403,
+            )
+    elif jwt_key not in {partner_id, agent_id}:
+        raise A2AAuthError(
+            A2AErrorCode.PARTNER_MISMATCH,
+            "JWT subject must match the claimed partner or agent_id.",
+            http_status=403,
+        )
+
+
 def check_ownership(
     envelope: A2AEnvelope,
     partner_id: Optional[str],

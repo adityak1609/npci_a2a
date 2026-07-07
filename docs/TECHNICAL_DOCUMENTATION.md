@@ -68,6 +68,7 @@ certification-simulator side is out of scope and is stubbed for local testing by
 | Cache / async state | Redis (prod) | Nonce/idempotency/rate-limit backing; Postgres fallback in dev |
 | Frontend | React 18 + Vite + TypeScript + Tailwind | SPA built to `frontend/dist`, served by FastAPI |
 | Realtime | WebSockets + SSE | WS for portal push (ticketed auth); SSE for chat streaming |
+| A2A transport (optional) | Google ADK + a2a-sdk (`google-adk[a2a]`) | Google-A2A wire for Bank↔NPCI; flag-selected via `NPCI_TRANSPORT`, parallel to the legacy JSON-RPC transport |
 | Observability | Prometheus metrics, OpenTelemetry tracing, JSON logs | `/metrics`, structured stdout logs |
 | Containers | Docker, docker-compose, Kubernetes | Multi-stage image (node build → python runtime) |
 | Reverse proxy | Nginx | TLS/mTLS termination in production topology |
@@ -83,6 +84,7 @@ e.g. `from database import ...`). Supporting concerns are packaged.
 NPCI_A2A/
 ├── main.py                 # FastAPI app: middleware, CORS, CSP, router wiring, lifespan
 ├── worker.py               # Out-of-process ingestion worker (A2A_INGESTION_MODE=worker)
+├── a2a_adk_server.py       # Bank's Google-A2A (ADK) server entrypoint (separate process, port 8002)
 │
 ├── config.py               # Env helpers, JSON logging, model list, retry policy
 ├── database.py             # SQLAlchemy engine, ORM models, init_db, audit hash-chain hooks
@@ -122,12 +124,13 @@ NPCI_A2A/
 ├── services/               # Business services
 │   ├── a2a_ingestor.py      # Async document ingestion + orphan/change recovery
 │   ├── a2a_vision.py        # Optional Gemini vision over PDF pages
-│   ├── npci_client.py       # Outbound NPCI JSON-RPC client
+│   ├── npci_client.py       # Outbound NPCI JSON-RPC client (legacy transport)
+│   ├── npci_a2a_client.py   # Outbound NPCI over Google A2A (ADK transport)
+│   ├── npci_transport.py    # Transport selector: NPCI_TRANSPORT=legacy|a2a
 │   ├── npci_outbound.py     # Outbound A2A message construction/dispatch
 │   ├── npci_reply.py        # Handle NPCI replies / clarification responses
 │   ├── email_notify.py      # Notification email (allowlist-filtered)
 │   ├── retention.py         # Data retention / purge jobs
-│   ├── task_queue.py        # Background task queue abstraction
 │   ├── kb_ingest.py         # Knowledge-base (voice-note / text) ingestion
 │   └── settings_store.py    # DB-backed runtime settings resolver
 │
@@ -135,7 +138,12 @@ NPCI_A2A/
 │   ├── dispatcher.py        # /a2a/internal JSON-RPC method dispatch
 │   ├── external_dispatcher.py # /a2a/external task_type dispatch (14 Part A types)
 │   ├── methods.py           # Internal JSON-RPC method-name constants
-│   └── errors.py            # JSON-RPC / A2A error shaping
+│   ├── errors.py            # JSON-RPC / A2A error shaping
+│   └── adk/                 # Google-A2A (ADK) transport
+│       ├── bank_agent.py     # Deterministic ADK BaseAgent (auth L5-L8 → dispatch_external)
+│       ├── transport_auth.py # ASGI middleware: auth L1-L4 incl. HMAC over raw body
+│       ├── a2a_client.py     # a2a-sdk sender + NpciEnvelopeAuth (HMAC/bearer signing)
+│       └── message_mapping.py # Envelope JSON ↔ A2A TextPart/FileParts
 │
 ├── ws/manager.py           # WebSocket connection manager
 │
@@ -162,6 +170,7 @@ NPCI_A2A/
 | --- | --- | --- |
 | `uvicorn main:app` / `gunicorn ... main:app` | `main.py` | API + SPA serving |
 | `python worker.py` (`A2A_INGESTION_MODE=worker`) | `worker.py` | Out-of-process document ingestion |
+| `uvicorn a2a_adk_server:a2a_app --port 8002` | `a2a_adk_server.py` | Bank's Google-A2A (ADK) server — inbound NPCI messages over the ADK transport; serves `/.well-known/agent-card.json` |
 
 ---
 
@@ -365,7 +374,8 @@ Unified AgentNxt A2A Protocol v1.0** (`a2a_models.py`).
 
 | Endpoint | Auth | Dispatch | Callers |
 | --- | --- | --- | --- |
-| `POST /a2a/external` | 8-layer chain (HMAC + mTLS + JWT …) | `agent/external_dispatcher.py` on `task_type` | NPCI platform / mock agent |
+| `POST /a2a/external` | 8-layer chain (HMAC + mTLS + JWT …) | `agent/external_dispatcher.py` on `task_type` | NPCI platform / mock agent (legacy transport) |
+| `POST /` on the ADK server (port 8002) | Same 8 layers, split L1–L4 middleware / L5–L8 agent (§7.7) | `agent/adk/bank_agent.py` → same `dispatch_external` | NPCI platform / mock agent (Google-A2A transport) |
 | `POST /a2a/internal` | Admin/PM JWT | `agent/dispatcher.py` on JSON-RPC `method` | The portal SPA |
 
 `POST /a2a` is deprecated and returns `410 Gone` — it previously mixed trust
@@ -428,8 +438,37 @@ Used only on `/a2a/internal` (admin/PM JWT):
 - Outbound Bank→NPCI portal actions: `agent.submit_counter_proposal`,
   `agent.report_milestone`, `agent.declare_readiness`, `agent.raise_blocker`
 
-Outbound dispatch to NPCI is built in `services/npci_outbound.py` /
-`services/npci_client.py` (mutual-TLS client in production).
+Outbound dispatch to NPCI is built in `services/npci_outbound.py` and sent via
+the transport selector `services/npci_transport.py` (`NPCI_TRANSPORT=legacy` →
+`services/npci_client.py` JSON-RPC + mTLS; `=a2a` → `services/npci_a2a_client.py`
+over Google A2A). Callers are transport-agnostic, so cutover is a config flip.
+
+### 7.7 Google A2A (ADK) transport
+
+A parallel, flag-selected wire for the same protocol: the NPCI spec's reference
+stack is `Google A2A SDK → JSON-RPC 2.0 → HMAC envelope → JWT bearer → TLS/mTLS
+→ nginx`, i.e. the Google SDK is the transport and the NPCI protocol layers ride
+on top of it. Nothing above the wire changes — same envelope, dispatcher,
+idempotency, state machine, and audit.
+
+- **Inbound** — `a2a_adk_server.py` runs the bank's deterministic ADK agent
+  (`agent/adk/bank_agent.py`, a `BaseAgent`, no LLM) as a standalone Google-A2A
+  server on `BANK_A2A_PORT` (8002). Auth is the same 8 layers, split by
+  insertion point: `agent/adk/transport_auth.py` (pure-ASGI middleware, gated by
+  `A2A_ADK_TRANSPORT_AUTH`) buffers the raw body and runs **L1 mTLS, L2 CIDR,
+  L3 HMAC (`verify_hmac` over the exact wire bytes), L4 JWT** before the
+  a2a-sdk parses the message; the agent then runs **L5 partner status/binding,
+  L6 ownership, L7 state machine, L8 agent identity** and delegates to the
+  unchanged `dispatch_external`. Rejections are audited to `a2a_messages`.
+- **Outbound** — `agent/adk/a2a_client.py` resolves the remote agent card and
+  sends via the a2a-sdk client; `NpciEnvelopeAuth` signs every request with the
+  HMAC envelope headers + bearer key (the same contract as the legacy client).
+- **Message mapping** — `agent/adk/message_mapping.py`: the envelope travels as
+  one `TextPart` of JSON; each `product_kit` document becomes a
+  `FilePart(FileWithBytes)`, re-injected by filename on receive so the ingestion
+  handler is reused unchanged.
+- **Mock** — `mock_npci_agent/adk_agent.py` is the Google-A2A sibling of the
+  legacy mock (port 8001) for local end-to-end testing.
 
 ---
 
@@ -540,7 +579,9 @@ FastAPI also serves Swagger UI (`/docs`), ReDoc (`/redoc`), and OpenAPI
 
 - **Ingestion worker** (`worker.py`) — in production, ingestion runs
   out-of-process (`A2A_INGESTION_MODE=worker`) so heavy embedding work never
-  blocks the API. `services/task_queue.py` abstracts the queue.
+  blocks the API; the `a2a_ingestion_jobs` table is the queue, claimed with
+  `SELECT … FOR UPDATE SKIP LOCKED` (the former `services/task_queue.py`
+  abstraction was removed).
 - **File watcher** — Watchdog monitors `data/`, debounces (5s), and feeds a
   bounded (≤50) sequential queue; one daemon worker ingests to avoid Gemini
   quota bursts. Admin uploads suppress duplicate watcher events.
@@ -587,6 +628,10 @@ FastAPI also serves Swagger UI (`/docs`), ReDoc (`/redoc`), and OpenAPI
 | `A2A_INGESTION_MODE` | `inline` (dev) / `worker` (**prod**) |
 | `NPCI_API_KEY`, `NPCI_AGENT_URL` | Outbound NPCI connection |
 | `NPCI_CLIENT_CERT_FILE`, `NPCI_CLIENT_KEY_FILE` | Outbound mTLS material |
+| `NPCI_TRANSPORT` | Outbound wire: `legacy` (JSON-RPC, default) / `a2a` (Google A2A via ADK) |
+| `NPCI_A2A_AGENT_CARD_URL` | NPCI agent's card URL (**required when `NPCI_TRANSPORT=a2a`**) |
+| `BANK_A2A_HOST`, `BANK_A2A_PORT` | Bank ADK server bind/card address (default 8002) |
+| `A2A_ADK_TRANSPORT_AUTH` | Enforce auth L1–L4 on the inbound ADK server (**true in prod**) |
 | `NPCI_REPLY_AUTO_INGEST` | Auto-ingest NPCI replies vs. `pending_review` |
 | `A2A_NOTIFY_LIST`, `A2A_NOTIFY_ALLOWLIST`, `A2A_NOTIFY_ALLOWED_DOMAINS` | Outbound-email allowlisting |
 | `CORS_ORIGINS` | Allowed browser origins (HTTPS-only in prod) |
@@ -638,6 +683,11 @@ Any variable may be supplied via a `*_FILE` path (Docker/K8s secrets), loaded by
   fully round-tripped against a real NPCI platform.
 - **task_type vocabulary** predates spec v1.0 in places; treat the enum as the
   source of truth for what is actually handled.
+- **ADK transport gaps** — on the Google-A2A path, the mTLS-fingerprint half of
+  partner binding (L5) is enforced at the reverse proxy rather than in-process,
+  and onboarding the real NPCI agent still requires exchanging the shared HMAC
+  secret and mapping their bearer subject in `A2A_JWT_PARTNER_MAP`. Per-agent /
+  per-task authorization (L8) is an open extension point on **both** transports.
 - Legacy surfaces remain for compatibility (`/feedback/*`, `/auth/login`,
   voice notes, `message_feedback`) and are not part of the active portal UX.
 

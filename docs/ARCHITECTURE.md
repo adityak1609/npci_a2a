@@ -11,6 +11,7 @@ migration must update.
 | --- | --- | --- |
 | `uvicorn main:app` | `main.py` | FastAPI app: middleware, CORS, CSP, router wiring, lifespan (DB init, job recovery, nonce cleanup). |
 | `python worker.py` | `worker.py` | Out-of-process ingestion worker (`A2A_INGESTION_MODE=worker`). |
+| `uvicorn a2a_adk_server:a2a_app` | `a2a_adk_server.py` | Bank's Google-A2A (ADK) server — separate process/port (`BANK_A2A_PORT`, default 8002); serves the agent card and receives NPCI A2A messages when the ADK transport is used. |
 
 ## Core modules (flat, repo root)
 
@@ -63,8 +64,8 @@ Grouped by responsibility. These are plain top-level modules imported absolutely
 | Package | Contents |
 | --- | --- |
 | `routes/` | FastAPI routers: `a2a`, `admin`, `auth`, `chat`, `feedback`, `sys`, `ws`. |
-| `services/` | A2A ingestor/vision/reply, NPCI client/outbound, retention, task queue, email, settings/KB stores. |
-| `agent/` | A2A dispatch: `dispatcher`, `external_dispatcher`, `methods`, `errors`. |
+| `services/` | A2A ingestor/vision/reply, NPCI clients (`npci_client` legacy JSON-RPC, `npci_a2a_client` Google A2A, `npci_transport` selector on `NPCI_TRANSPORT`), outbound, retention, email, settings/KB stores. |
+| `agent/` | A2A dispatch: `dispatcher`, `external_dispatcher`, `methods`, `errors`; `agent/adk/` — Google-A2A transport (`bank_agent` deterministic ADK agent, `transport_auth` L1–L4 middleware, `a2a_client` outbound sender + HMAC/bearer signing, `message_mapping` envelope↔A2A parts). |
 | `ws/` | WebSocket connection manager. |
 
 ## Supporting directories
@@ -76,7 +77,7 @@ Grouped by responsibility. These are plain top-level modules imported absolutely
 | `tests/` | Unit tests; `tests/integration/` needs Postgres/pgvector. |
 | `deploy/` | nginx, k8s, prometheus, grafana, alertmanager, secrets. |
 | `docs/` | Project documentation (this file + tech-stack, runbook, security notes). |
-| `mock_npci_agent/` | Local NPCI counterpart for end-to-end testing. |
+| `mock_npci_agent/` | Local NPCI counterpart for end-to-end testing (`main.py` legacy protocol; `adk_agent.py` Google-A2A sibling on port 8001). |
 | `load_tests/`, `tools/`, `scripts/` | Locust load test, ad-hoc tools, ops scripts. |
 | `ai_compliance_docs/`, `data/` | Compliance agreement, seed data / docs. |
 
