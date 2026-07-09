@@ -184,6 +184,45 @@ has a structured **Inbox** to answer bank queries and decide counter-proposals,
 blockers, and milestones by hand. Ensure the bank's `.env` has
 `NPCI_AGENT_URL=http://localhost:8001/a2a` and `A2A_MTLS_REQUIRED=false`.
 
+> The steps above run the **legacy custom** transport (`/a2a/external`, JSON-RPC
+> + HMAC). To run on **Google A2A** — the transport NPCI's real agent speaks —
+> use the ADK path below instead.
+
+### 7. (Alternative) Run everything on the Google A2A (ADK) transport
+
+The real NPCI agent speaks **Google A2A**, not the custom protocol. This mode
+runs the same business core over the ADK transport. One command starts all three
+processes wired together:
+
+```powershell
+.\start_a2a.ps1
+```
+
+It launches (each in its own window):
+
+| Process | Command | URL |
+|---|---|---|
+| Bank portal (SPA + `/a2a/internal`) | `uvicorn main:app` | http://localhost:8000 |
+| Bank ADK A2A server (inbound NPCI→Bank) | `uvicorn a2a_adk_server:a2a_app` | http://localhost:8002 |
+| Mock NPCI ADK agent (Google-A2A counterpart) | `uvicorn mock_npci_agent.adk_agent:a2a_app` | http://localhost:8001 |
+
+The script sets `NPCI_TRANSPORT=a2a` (so the portal's Bank→NPCI messages route
+over A2A to the mock's card at `:8001`) and points the mock at the bank's card at
+`:8002`. On a fresh venv it first installs the ADK deps from `requirements.txt`.
+Transport auth (spec §4.1 L1–4) is left **off** for local dev via
+`A2A_ADK_TRANSPORT_AUTH=false`; set it `true` (with the mTLS/HMAC/JWT config) for
+a production-shaped run.
+
+The ADK mock has no trigger UI — push a `change_communication` from the CLI:
+
+```powershell
+python -m mock_npci_agent.push_change_a2a
+# or: python -m mock_npci_agent.push_change_a2a --change-id CHG-UPI-2026-001 --file spec.pdf
+```
+
+Queries the bank raises are auto-answered by the mock with a
+`clarification_response` sent back to the bank's card.
+
 ---
 
 ## A2A endpoints
