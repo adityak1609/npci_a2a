@@ -10,7 +10,10 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from auth import (
+from core.config import env_bool, env_int
+from core.metrics import inc_counter
+from database import AuditLog, get_db
+from security.auth import (
     AUTH_COOKIE_NAME,
     Token,
     User,
@@ -27,10 +30,7 @@ from auth import (
     revoke_token,
     verify_totp,
 )
-from config import env_bool, env_int
-from database import get_db, AuditLog
-from metrics import inc_counter
-from rate_limit import check_rate_limit, record_login_failure, check_login_lockout
+from security.rate_limit import check_login_lockout, check_rate_limit, record_login_failure
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -236,9 +236,9 @@ def auth_refresh(
     # Create a new token for the currently authenticated user
     new_token = create_access_token({"sub": current_user.email})
     _set_auth_cookie(response, new_token)
-    
+
     _write_audit_log(db, current_user.id, "token_refresh", target="token")
-    
+
     return Token(
         access_token=new_token,
         user_email=current_user.email,

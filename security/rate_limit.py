@@ -14,9 +14,8 @@ from collections import defaultdict, deque
 
 from fastapi import HTTPException, status
 
-from config import env_int
-from metrics import inc_counter
-
+from core.config import env_int
+from core.metrics import inc_counter
 
 _lock = threading.Lock()
 _buckets: dict[tuple[str, str], deque[float]] = defaultdict(deque)

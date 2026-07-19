@@ -142,7 +142,7 @@ def _verify_chain(rows, label: str, fields: list[str]) -> list[str]:
                 f"{label} id={row.id}: prev_hash={row.prev_hash} expected={previous}"
             )
         expected_hash = hashlib.sha256(
-            f"{row.prev_hash}.{_audit_chain_payload(row, fields)}".encode("utf-8")
+            f"{row.prev_hash}.{_audit_chain_payload(row, fields)}".encode()
         ).hexdigest()
         if row.entry_hash != expected_hash:
             errors.append(

@@ -12,8 +12,8 @@ import re
 from datetime import datetime, timezone
 
 from database import DocumentChunk, DocumentSummary, SessionLocal
-from ingest import _get_client, chunk_text, generate_embeddings
-from retriever import invalidate_cache
+from rag.ingest import _get_client, chunk_parent_child, generate_embeddings
+from rag.retriever import invalidate_cache
 
 KB_SOURCE = "kb_paste"
 
@@ -48,23 +48,25 @@ def ingest_text_document(title: str, content: str, source: str | None = None) ->
     if not content:
         raise ValueError("content is required.")
 
-    chunks = chunk_text(content)
+    chunks = chunk_parent_child(content)
     if not chunks:
         raise ValueError("content produced no indexable text.")
 
     client = _get_client()
-    embeddings = generate_embeddings(chunks, client)
+    embeddings = generate_embeddings([c["text"] for c in chunks], client)
 
     db = SessionLocal()
     try:
         # Replace any existing KB doc with the same title (re-index).
         db.query(DocumentChunk).filter(DocumentChunk.source_file == title).delete()
-        for idx, (text, embedding) in enumerate(zip(chunks, embeddings)):
+        for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
             db.add(DocumentChunk(
                 source_file=title,
                 chunk_index=idx,
-                text=text,
+                text=chunk["text"],
                 embedding=embedding,
+                parent_key=chunk.get("parent_key"),
+                parent_text=chunk.get("parent_text"),
                 source=KB_SOURCE,
                 visibility_tier="admin",
                 source_doc=source,

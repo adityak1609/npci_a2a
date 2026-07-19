@@ -1,5 +1,5 @@
 """
-compliance.py — Hardened AI compliance gates.
+security/compliance.py — Hardened AI compliance gates.
 
 Provides per-call, data-classification-aware enforcement of the
 EXTERNAL_AI_DATA_PROCESSING_APPROVED policy gate.
@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 
-from config import env_bool
+from core.config import env_bool
 
 logger = logging.getLogger(__name__)
 

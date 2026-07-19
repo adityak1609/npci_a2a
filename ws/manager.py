@@ -9,6 +9,7 @@ redis.pubsub subscription per WebSocket).
 """
 
 from collections import defaultdict
+
 from fastapi import WebSocket
 
 

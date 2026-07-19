@@ -17,17 +17,17 @@ Additional helpers:
     - sanitize_chunk()     — neutralises prompt injection inside PDF text
 """
 
+import logging
 import os
 import re
-import logging
 import threading
 import time
 from dataclasses import dataclass
 from typing import Literal, Optional
 
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -64,7 +64,7 @@ def _get_classifier_client() -> genai.Client:
     if _classifier_client is None:
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
-            raise EnvironmentError("GOOGLE_API_KEY not set.")
+            raise OSError("GOOGLE_API_KEY not set.")
         _classifier_client = genai.Client(api_key=api_key)
     return _classifier_client
 

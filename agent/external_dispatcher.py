@@ -21,37 +21,32 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
-from a2a_audit import (
+from a2a_core.audit import (
+    IdempotencyClaim,
     claim_idempotency_key,
     complete_idempotency_claims,
     compute_business_key_marker,
-    IdempotencyClaim,
     log_a2a_message,
 )
-from a2a_auth import A2AAuthContext
-from a2a_models import (
+from a2a_core.auth import A2AAuthContext
+from a2a_core.models import (
     A2AEnvelope,
     A2ATaskType,
     BlockerResolutionPayload,
     BlockerStatusUpdatePayload,
-    ClarificationResponsePayload,
-    ChangeCommunicationPayload,
     CounterDecisionPayload,
-    EchoPayload,
     EchoResponse,
-    QueryPayload,
 )
-from a2a_state import (
+from a2a_core.state import (
     CERT_TASK_TARGET,
     advance_cert_state,
     advance_change_state,
     change_target_state,
 )
-
 
 # ---------------------------------------------------------------------------
 # Handler type

@@ -1,9 +1,7 @@
 """
 tests/test_retention.py — Unit tests for data retention and GDPR anonymization.
 """
-import pytest
-from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock
 
 
 class TestRetentionPurge:

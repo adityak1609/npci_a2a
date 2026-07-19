@@ -4,18 +4,16 @@ tests/integration/test_a2a_idempotency.py
 Integration tests verifying A2A idempotency and replay attack prevention.
 Uses testcontainers to spin up a real PostgreSQL instance.
 """
-import asyncio
 import hashlib
-import time
 import uuid
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from testcontainers.postgres import PostgresContainer
 
-from database import Base, A2AIdempotencyKey, A2AMessage
+from database import A2AIdempotencyKey, A2AMessage, Base
 
 
 @pytest.fixture(scope="module")

@@ -14,30 +14,29 @@ The pgvector extension must be enabled in your Postgres database:
 import hashlib
 import json
 import os
+import uuid
 from datetime import datetime, timezone
-from pgvector.sqlalchemy import Vector
-from dotenv import load_dotenv
 
+from dotenv import load_dotenv
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
-    create_engine,
-    Column,
-    Integer,
-    String,
     Boolean,
-    Text,
+    Column,
     DateTime,
     ForeignKey,
-    UniqueConstraint,
     Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
     event,
 )
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
-from pgvector.sqlalchemy import Vector
-import uuid
-from config import env_bool, env_int
-from embedding_config import embedding_dim
-from secrets_loader import load_secret_files
+
+from core.config import env_bool, env_int
+from core.secrets_loader import load_secret_files
+from rag.embedding_config import embedding_dim
 
 load_dotenv()
 load_secret_files()
@@ -298,11 +297,19 @@ class DocumentChunk(Base):
     source_file = Column(String(512), nullable=False)   # e.g. "policy.pdf"
     chunk_index = Column(Integer, nullable=False)
     text = Column(Text, nullable=False)
-    
+
     # Configurable dimension for Gemini's Matryoshka embedding outputs.
     _EMBEDDING_DIM = embedding_dim()
     embedding = Column(Vector(_EMBEDDING_DIM), nullable=False)
-    
+
+    # Parent-child chunking: children (these rows) are embedded for precise
+    # retrieval; parent_text carries the surrounding passage handed to the LLM.
+    # NULL on legacy/single chunks — retrieval falls back to `text`.
+    # (The BM25 `text_search` tsvector companion column is Postgres-generated
+    # and deliberately unmapped so SQLite-based tests can still create_all.)
+    parent_key = Column(String(150), nullable=True)
+    parent_text = Column(Text, nullable=True)
+
     source = Column(String(100), nullable=False, default="admin_upload", server_default="admin_upload")
     visibility_tier = Column(String(50), nullable=False, default="admin", server_default="admin")
     page_number = Column(Integer, nullable=True)
@@ -787,7 +794,7 @@ def _apply_hash_chain(connection, target, table_name: str, fields: list[str]) ->
     target.prev_hash = prev_hash or "GENESIS"
     canonical = _audit_chain_payload(target, fields)
     target.entry_hash = hashlib.sha256(
-        f"{target.prev_hash}.{canonical}".encode("utf-8")
+        f"{target.prev_hash}.{canonical}".encode()
     ).hexdigest()
 
 
@@ -864,6 +871,27 @@ def init_db() -> None:
             USING hnsw (embedding vector_cosine_ops)
             WITH (m = 16, ef_construction = 64)
         """))
+        # Hybrid retrieval (mirrors Alembic 20260710_0012): parent-child
+        # columns come from create_all; the generated tsvector column cannot
+        # be declared in the ORM (SQLite tests), so add it here for dev DBs.
+        conn.execute(text(
+            "ALTER TABLE document_chunks "
+            "ADD COLUMN IF NOT EXISTS text_search tsvector "
+            "GENERATED ALWAYS AS (to_tsvector('english', text)) STORED"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_document_chunks_text_search "
+            "ON document_chunks USING gin (text_search)"
+        ))
+        # Pre-existing dev databases created before parent-child chunking.
+        conn.execute(text(
+            "ALTER TABLE document_chunks "
+            "ADD COLUMN IF NOT EXISTS parent_key VARCHAR(150)"
+        ))
+        conn.execute(text(
+            "ALTER TABLE document_chunks "
+            "ADD COLUMN IF NOT EXISTS parent_text TEXT"
+        ))
 
     if env_bool("ALLOW_LEGACY_INLINE_MIGRATIONS", default=False):
         _apply_legacy_inline_migrations()

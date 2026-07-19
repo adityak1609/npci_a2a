@@ -1,5 +1,5 @@
 """
-a2a_auth.py — 8-layer authentication and authorization stack for /a2a/external.
+a2a_core/auth.py — 8-layer authentication and authorization stack for /a2a/external.
 
 Implements the NPCI A2A spec §4.1 auth chain.  Each layer short-circuits on
 failure with the exact spec error code string so that NPCI SOC tooling (and
@@ -31,7 +31,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import unquote
@@ -39,10 +39,9 @@ from urllib.parse import unquote
 from fastapi import Request
 from sqlalchemy.orm import Session
 
-from a2a_models import A2AEnvelope, A2AErrorCode, A2ATaskType
-from config import env_bool
-from database import A2AChange, A2ACflow, A2AMessage, A2ANonce, SessionLocal
-
+from a2a_core.models import A2AEnvelope, A2AErrorCode, A2ATaskType
+from core.config import env_bool
+from database import A2ACflow, A2AChange, A2ANonce
 
 # ---------------------------------------------------------------------------
 # Configuration helpers
@@ -390,7 +389,7 @@ def verify_jwt_session(request: Request, db: Session) -> Optional[str]:
 
     token = auth_header[7:]  # Strip "Bearer "
     try:
-        from auth import decode_token
+        from security.auth import decode_token
         payload = decode_token(token)
     except Exception:
         raise A2AAuthError(
@@ -590,7 +589,7 @@ def check_state_transition(envelope: A2AEnvelope, db: Session) -> None:
     Delegates to a2a_state.validate_transition (created in Phase 3).
     Imported lazily to avoid circular dependency during startup.
     """
-    from a2a_state import validate_transition
+    from a2a_core.state import validate_transition
 
     # Skip state checks for stateless task types
     stateless_types = {

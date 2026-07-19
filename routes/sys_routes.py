@@ -1,21 +1,20 @@
 """Core ingestion and metrics endpoints."""
 
-import os
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
-from sqlalchemy.orm import Session
+import os
 
-from database import engine, get_db, SessionLocal
-from rate_limit import check_a2a_external_rate_limit
-from metrics import render_prometheus
-from retriever import index_exists, invalidate_cache
-from guardrails import classifier_circuit_state
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import PlainTextResponse
+
+from core.metrics import render_prometheus, set_gauge
+from core.telemetry import _log_internal_error
+from database import A2AIngestionJob, SessionLocal, engine
+from rag.ingest import run_ingestion
+from rag.retriever import index_exists, invalidate_cache
 from routes.auth_routes import require_metrics_access
-from auth import User, get_current_admin
-from ingest import run_ingestion
-from compliance import ComplianceBlockedError
-from telemetry import _log_internal_error
+from security.auth import User, get_current_admin
+from security.compliance import ComplianceBlockedError
+from security.guardrails import classifier_circuit_state
 
 router = APIRouter()
 
@@ -37,7 +36,7 @@ async def health_check():
 
 @router.get("/health/live", tags=["System"])
 async def health_live():
-    """Kubernetes liveness probe â€” confirms the process is running.
+    """Kubernetes liveness probe — confirms the process is running.
 
     Always returns 200 unless the process has crashed.  Intentionally
     lightweight: no external calls so it cannot trigger a pod restart
@@ -48,7 +47,7 @@ async def health_live():
 
 @router.get("/health/ready", tags=["System"])
 async def health_ready():
-    """Kubernetes readiness probe â€” confirms the app can serve traffic.
+    """Kubernetes readiness probe — confirms the app can serve traffic.
 
     Checks:
     - PostgreSQL reachability (SELECT 1)

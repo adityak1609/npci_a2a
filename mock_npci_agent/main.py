@@ -52,7 +52,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 from dotenv import load_dotenv
@@ -2669,7 +2669,7 @@ async def _shutdown():
         _outbox_dispatcher_task.cancel()
         try:
             await asyncio.wait_for(_outbox_dispatcher_task, timeout=5)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
+        except (TimeoutError, asyncio.CancelledError):
             pass
 
 

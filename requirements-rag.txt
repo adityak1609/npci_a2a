@@ -1,0 +1,21 @@
+# Optional RAG-quality extras — install alongside requirements.txt:
+#     pip install -r requirements-rag.txt
+#
+# Everything here degrades gracefully when absent:
+#   * without sentence-transformers → retrieval uses RRF ordering (no rerank)
+#   * without pytesseract/Pillow    → image ingestion goes straight to Gemini Vision
+#
+# NOTE: sentence-transformers pulls in torch (~2 GB). The default reranker
+# model (BAAI/bge-reranker-v2-m3, ~2.3 GB) downloads on first use; set
+# A2A_RERANK_MODEL to a smaller cross-encoder (e.g.
+# cross-encoder/ms-marco-MiniLM-L-6-v2) for constrained environments, or
+# A2A_RERANK_ENABLED=false to skip reranking entirely.
+
+# Cross-encoder rerank (CPU inference, fully local)
+sentence-transformers==3.3.1
+
+# Local OCR gate (also requires the Tesseract binary on PATH:
+#   Windows: winget install UB-Mannheim.TesseractOCR
+#   Debian:  apt-get install tesseract-ocr)
+pytesseract==0.3.13
+Pillow==11.1.0

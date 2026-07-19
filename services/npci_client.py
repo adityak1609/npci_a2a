@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import time
 import uuid
@@ -21,10 +22,11 @@ import httpx
 from database import (
     A2AChange,
     AuditLog,
-    DocumentChunk,
     NpciTicket,
     SessionLocal,
 )
+
+logger = logging.getLogger(__name__)
 
 # Outbound retry configuration
 _OUTBOUND_MAX_RETRIES = 3
@@ -37,7 +39,7 @@ def _outbound_cert():
     key_file = os.getenv("NPCI_CLIENT_KEY_FILE", "").strip()
     if os.getenv("APP_ENV", "development").strip().lower() == "production":
         if not cert_file or not key_file:
-            raise EnvironmentError(
+            raise OSError(
                 "NPCI_CLIENT_CERT_FILE and NPCI_CLIENT_KEY_FILE are required in production."
             )
     if cert_file and key_file:
@@ -51,7 +53,7 @@ def _signed_headers(raw_body: bytes) -> dict:
     from services.settings_store import get_setting
     api_key = get_setting("NPCI_API_KEY", os.getenv("NPCI_API_KEY"))
     if not api_key:
-        raise EnvironmentError("NPCI_API_KEY must be set.")
+        raise OSError("NPCI_API_KEY must be set.")
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -81,7 +83,7 @@ async def post_npci_rpc(rpc_payload: dict) -> dict:
     from services.settings_store import get_setting
     url = get_setting("NPCI_AGENT_URL", os.getenv("NPCI_AGENT_URL"))
     if not url:
-        raise EnvironmentError("NPCI_AGENT_URL must be set.")
+        raise OSError("NPCI_AGENT_URL must be set.")
 
     raw_body = json.dumps(rpc_payload, separators=(",", ":"), default=str).encode("utf-8")
     cert = _outbound_cert()
@@ -110,9 +112,9 @@ async def post_npci_rpc(rpc_payload: dict) -> dict:
             last_exc = exc
             if attempt < _OUTBOUND_MAX_RETRIES:
                 wait = _OUTBOUND_BACKOFF_BASE * (2 ** attempt)
-                print(
-                    f"[npci_client] Transient error on attempt {attempt + 1}/"
-                    f"{_OUTBOUND_MAX_RETRIES + 1}, retrying in {wait}s: {exc}"
+                logger.warning(
+                    "Transient error on attempt %s/%s, retrying in %ss: %s",
+                    attempt + 1, _OUTBOUND_MAX_RETRIES + 1, wait, exc,
                 )
                 await asyncio.sleep(wait)
         except Exception as exc:

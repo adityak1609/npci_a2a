@@ -26,7 +26,7 @@ from google.adk.agents import BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event
 
-from a2a_auth import (
+from a2a_core.auth import (
     A2AAuthContext,
     A2AAuthError,
     check_agent_identity,
@@ -122,8 +122,8 @@ class BankA2AProtocolAgent(BaseAgent):
         """Log an L5-L8 authz rejection to a2a_messages (parity with the legacy
         endpoint). Auditing must never mask the real rejection."""
         try:
-            from a2a_audit import log_a2a_rejection
-            from metrics import inc_counter
+            from a2a_core.audit import log_a2a_rejection
+            from core.metrics import inc_counter
 
             inc_counter("a2a_auth_rejections_total", {"error_code": exc.error_code})
             log_a2a_rejection(

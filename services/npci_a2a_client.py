@@ -23,7 +23,7 @@ def _npci_card_url() -> str:
 
     url = get_setting("NPCI_A2A_AGENT_CARD_URL", os.getenv("NPCI_A2A_AGENT_CARD_URL"))
     if not url:
-        raise EnvironmentError(
+        raise OSError(
             "NPCI_A2A_AGENT_CARD_URL must be set to the NPCI agent's A2A card URL "
             "(e.g. http://localhost:8001/.well-known/agent-card.json) when "
             "NPCI_TRANSPORT=a2a."

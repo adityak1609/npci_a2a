@@ -4,8 +4,8 @@ import types
 import unittest
 from unittest.mock import patch
 
-import guardrails
-from guardrails import (
+from security import guardrails
+from security.guardrails import (
     ClassifierDecision,
     VerifiedStreamBuffer,
     _classify_with_llm,

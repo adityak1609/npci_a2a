@@ -2,7 +2,7 @@
 
 import importlib
 
-import config
+from core import config
 
 
 def test_gemini_models_includes_primary_and_fallback(monkeypatch):

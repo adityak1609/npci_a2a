@@ -1,15 +1,17 @@
 """OpenTelemetry setup for distributed tracing."""
 
 import os
+
+from fastapi import FastAPI
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
-from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
-from fastapi import FastAPI
+
 
 def configure_telemetry(app: FastAPI) -> None:
     """Configures OpenTelemetry for the FastAPI app if enabled."""
@@ -17,20 +19,20 @@ def configure_telemetry(app: FastAPI) -> None:
     if not otlp_endpoint:
         # Tracing disabled
         return
-        
+
     resource = Resource(attributes={
         "service.name": "npci-a2a-api"
     })
-    
+
     provider = TracerProvider(resource=resource)
     processor = BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True))
     provider.add_span_processor(processor)
     trace.set_tracer_provider(provider)
-    
+
     # Instrumentations
     FastAPIInstrumentor.instrument_app(app)
     HTTPXClientInstrumentor().instrument()
-    
+
     try:
         from database import engine
         SQLAlchemyInstrumentor().instrument(

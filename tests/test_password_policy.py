@@ -4,9 +4,9 @@ import bcrypt
 import pytest
 from fastapi import HTTPException
 
-from auth import (
-    MAX_PASSWORD_LENGTH,
+from security.auth import (
     _PREHASH_PREFIX,
+    MAX_PASSWORD_LENGTH,
     hash_password,
     validate_password_strength,
     verify_password,

@@ -1,5 +1,5 @@
 """
-prompt.py — System prompt template for Mindgate Policy Bot.
+rag/prompt.py — System prompt template for Mindgate Policy Bot.
 
 Contains the grounding prompt injected with retrieved policy chunks
 before each Gemini API call.

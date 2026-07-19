@@ -1,28 +1,27 @@
-import os
 import asyncio
+import os
 import time
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
-from a2a_models import A2AEnvelope
-from a2a_models import A2ATaskType
-from agent.external_dispatcher import (
-    EXTERNAL_HANDLERS,
-    NotImplementedTaskError,
-    _not_implemented_handler,
-)
-from a2a_auth import (
+from a2a_core.auth import (
     A2AAuthContext,
     A2AAuthError,
     check_credential_binding,
     verify_hmac,
 )
-from compliance import ComplianceBlockedError, require_external_ai_approval
-from file_validation import FileValidationError, decode_base64_limited, validate_pdf_bytes
-from rate_limit import check_rate_limit
-from auth import create_access_token, decode_token
+from a2a_core.models import A2AEnvelope, A2ATaskType
+from agent.external_dispatcher import (
+    EXTERNAL_HANDLERS,
+    NotImplementedTaskError,
+    _not_implemented_handler,
+)
+from security.auth import create_access_token, decode_token
+from security.compliance import ComplianceBlockedError, require_external_ai_approval
+from security.file_validation import FileValidationError, decode_base64_limited, validate_pdf_bytes
+from security.rate_limit import check_rate_limit
 
 
 def test_external_ai_processing_fails_closed_by_default(monkeypatch):

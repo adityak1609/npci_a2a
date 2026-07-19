@@ -55,7 +55,7 @@ The following categories of data are PROHIBITED from being sent to Gemini API an
 - [ ] IP addresses (where linked to individuals)
 
 ### 3.2 Redaction Mechanism
-- **Tool used**: `guardrails.py` PII detection layer
+- **Tool used**: `security/guardrails.py` PII detection layer
 - **Operator must verify**: Guardrails are active (`GUARDRAILS_ENABLED=true`) before enabling external AI.
 
 ---

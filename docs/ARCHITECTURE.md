@@ -1,70 +1,65 @@
 # Architecture & Repository Layout
 
-This document maps the codebase so contributors can navigate a repository whose
-core modules currently live in a **flat layout** (all at the repo root). It also
-records the recommended target package layout and the exact touchpoints a future
-migration must update.
+This document maps the codebase so contributors can navigate it. Core modules
+are grouped into four topical packages (`core/`, `security/`, `a2a_core/`,
+`rag/`); only runtime entrypoints and the ORM hub stay at the repo root.
 
-## Runtime entrypoints
+## Runtime entrypoints (repo root)
 
 | Command | File | Purpose |
 | --- | --- | --- |
 | `uvicorn main:app` | `main.py` | FastAPI app: middleware, CORS, CSP, router wiring, lifespan (DB init, job recovery, nonce cleanup). |
-| `python worker.py` | `worker.py` | Out-of-process ingestion worker (`A2A_INGESTION_MODE=worker`). |
+| `python worker.py` | `worker.py` | Out-of-process ingestion worker (`A2A_INGESTION_MODE=worker`); also owns the daily retention run. |
 | `uvicorn a2a_adk_server:a2a_app` | `a2a_adk_server.py` | Bank's Google-A2A (ADK) server — separate process/port (`BANK_A2A_PORT`, default 8002); serves the agent card and receives NPCI A2A messages when the ADK transport is used. |
+| `python audit_export.py export\|verify` | `audit_export.py` | Export/verify the append-only audit logs (see `deploy/audit/README.md`). |
+| — | `database.py` | SQLAlchemy engine, session, ORM models, `init_db`. Kept at root because it is imported by nearly every module and by Alembic migrations. |
 
-## Core modules (flat, repo root)
+## Packages
 
-Grouped by responsibility. These are plain top-level modules imported absolutely
-(e.g. `from database import ...`).
-
-### Platform / infrastructure
+### `core/` — cross-cutting plumbing
 | Module | Responsibility |
 | --- | --- |
-| `config.py` | Shared configuration and logging helpers. |
-| `database.py` | SQLAlchemy engine, session, ORM models, `init_db`. |
-| `secrets_loader.py` | Load secrets from `*_FILE` paths into the environment. |
-| `telemetry.py` | OpenTelemetry distributed tracing setup. |
-| `metrics.py` | Prometheus metrics (multi-process Gunicorn aware). |
-| `csrf.py` | Origin/Referer CSRF protection for cookie-auth routes. |
-| `rate_limit.py` | Rate limiting for security-sensitive endpoints. |
-| `utils.py` | Shared helpers. |
+| `core/config.py` | Env helpers, Gemini model selection, and logging setup (`LOG_FORMAT=json\|text`, `LOG_LEVEL`, request-id injection). |
+| `core/secrets_loader.py` | Load secrets from `*_FILE` paths into the environment. |
+| `core/telemetry.py` | OpenTelemetry distributed tracing setup. |
+| `core/metrics.py` | Prometheus metrics (multi-process Gunicorn aware). |
+| `core/utils.py` | Chat history windowing, title generation, Gemini call-with-fallback wrappers. |
 
-### Authentication
+### `security/` — request-security layers
 | Module | Responsibility |
 | --- | --- |
-| `auth.py` | User auth, JWT issue/revoke, role dependencies, login models. |
+| `security/auth.py` | User auth, JWT issue/revoke, role dependencies, login models. |
+| `security/csrf.py` | Origin/Referer CSRF protection for cookie-auth routes. |
+| `security/rate_limit.py` | Rate limiting for security-sensitive endpoints. |
+| `security/file_validation.py` | Validate files before OCR/parse/embed/store. |
+| `security/compliance.py` | External-AI data-processing approval gate. |
+| `security/guardrails.py` | Input/output guardrails, verified-stream buffering. |
 
-### A2A protocol (Bank-side)
+### `a2a_core/` — NPCI A2A protocol (Bank-side)
+Named `a2a_core` because the Google A2A SDK owns the top-level `a2a` package
+name (`from a2a.types import ...`) — a local `a2a/` directory would shadow it.
+
 | Module | Responsibility |
 | --- | --- |
-| `a2a_models.py` | A2A message/envelope schemas. |
-| `a2a_auth.py` | HMAC / mTLS / JWT credential binding for A2A. |
-| `a2a_state.py` | A2A task/idempotency state. |
-| `a2a_audit.py` | A2A-specific audit trail. |
+| `a2a_core/models.py` | A2A message/envelope schemas (spec v1.0). |
+| `a2a_core/auth.py` | 8-layer HMAC / mTLS / JWT credential binding for `/a2a/external`. |
+| `a2a_core/state.py` | Change/Certification lifecycle state machines, idempotency state. |
+| `a2a_core/audit.py` | A2A-specific append-only audit trail. |
 
-### RAG / AI
+### `rag/` — retrieval pipeline
 | Module | Responsibility |
 | --- | --- |
-| `retriever.py` | Vector retrieval over document chunks. |
-| `ingest.py` | PDF ingestion pipeline. |
-| `prompt.py` | Prompt construction. |
-| `embedding_config.py` | Shared embedding dimensionality config. |
-| `guardrails.py` | Input/output guardrails, verified-stream buffering. |
+| `rag/retriever.py` | Hybrid retrieval: dense (pgvector) + BM25, RRF fusion, optional rerank, source bias, parent dedup. |
+| `rag/ingest.py` | PDF ingestion pipeline (`python -m rag.ingest` standalone). |
+| `rag/prompt.py` | Prompt construction. |
+| `rag/embedding_config.py` | Shared embedding dimensionality config. |
 
-### Compliance & validation
-| Module | Responsibility |
-| --- | --- |
-| `compliance.py` | External-AI data-processing approval gate. |
-| `file_validation.py` | Validate files before OCR/parse/embed/store. |
-| `audit_export.py` | Export and verify append-only audit logs. |
-
-## Existing packages
+### Pre-existing packages
 
 | Package | Contents |
 | --- | --- |
 | `routes/` | FastAPI routers: `a2a`, `admin`, `auth`, `chat`, `feedback`, `sys`, `ws`. |
-| `services/` | A2A ingestor/vision/reply, NPCI clients (`npci_client` legacy JSON-RPC, `npci_a2a_client` Google A2A, `npci_transport` selector on `NPCI_TRANSPORT`), outbound, retention, email, settings/KB stores. |
+| `services/` | A2A ingestor/vision/reply, OCR gate, reranker, NPCI clients (`npci_client` legacy JSON-RPC, `npci_a2a_client` Google A2A, `npci_transport` selector on `NPCI_TRANSPORT`), outbound, retention, email, settings/KB stores. |
 | `agent/` | A2A dispatch: `dispatcher`, `external_dispatcher`, `methods`, `errors`; `agent/adk/` — Google-A2A transport (`bank_agent` deterministic ADK agent, `transport_auth` L1–L4 middleware, `a2a_client` outbound sender + HMAC/bearer signing, `message_mapping` envelope↔A2A parts). |
 | `ws/` | WebSocket connection manager. |
 
@@ -72,7 +67,7 @@ Grouped by responsibility. These are plain top-level modules imported absolutely
 
 | Dir | Purpose |
 | --- | --- |
-| `alembic/` | DB migrations (`versions/`) + `env.py`. |
+| `alembic/` | DB migrations (`versions/`) + `env.py`. Migrations import only `database` and SQLAlchemy — keep it that way so historical revisions stay runnable. |
 | `frontend/` | React/Vite SPA (`src/`), built to `frontend/dist`. |
 | `tests/` | Unit tests; `tests/integration/` needs Postgres/pgvector. |
 | `deploy/` | nginx, k8s, prometheus, grafana, alertmanager, secrets. |
@@ -81,41 +76,30 @@ Grouped by responsibility. These are plain top-level modules imported absolutely
 | `load_tests/`, `tools/`, `scripts/` | Locust load test, ad-hoc tools, ops scripts. |
 | `ai_compliance_docs/`, `data/` | Compliance agreement, seed data / docs. |
 
----
+## Logging & debugging
 
-## Recommended target layout (not yet applied)
+- `core.config.configure_logging()` is called once per process (main, worker,
+  ADK server, standalone ingest). Runtime code logs through
+  `logging.getLogger(__name__)` — no `print()` in shipping modules, so every
+  message carries its module name, level, and request id.
+- `LOG_FORMAT=text` gives human-readable local output; the default `json` is
+  for container log collectors. `LOG_LEVEL=DEBUG` turns up verbosity.
+- Request ids propagate via `core.config.request_id_var` and appear in every
+  log line, letting you trace one request across routes → services → RAG.
 
-The flat core modules are the main structural debt. A future migration should
-consolidate them into a single importable package:
+## Conventions
 
-```
-app/
-  main.py            # entrypoint -> app.main:app
-  worker.py          # entrypoint -> python -m app.worker
-  core/              config, database, utils, secrets_loader, telemetry,
-                     metrics, csrf, rate_limit
-  auth/              auth
-  a2a/               models, auth, state, audit
-  rag/               retriever, ingest, prompt, embedding_config, guardrails
-  compliance/        compliance, file_validation, audit_export
-  routes/  services/  agent/  ws/     # moved under app/ unchanged
-```
+- **Absolute imports only** (`from security.auth import ...`); package
+  `__init__.py` files re-export nothing, keeping the import graph explicit and
+  cycle-free (`database.py` imports `rag.embedding_config` while `rag.ingest`
+  imports `database` — an eager `rag/__init__` would deadlock that).
+- New entrypoints must stay importable at the repo root (Docker/`start*.ps1`
+  reference `main:app`, `a2a_adk_server:a2a_app`, `worker.py` by module name).
+- CI type-checks `main.py core/ security/ a2a_core/ rag/ agent/ routes/
+  services/ ws/` (`.github/workflows/ci.yml`) — add new packages to that list.
 
-### Migration touchpoints (do all in one PR, then run the test suite)
-Moving the core modules rewrites **~160 import statements across ~45 files**.
-Beyond the imports, these must be updated together or the app breaks:
+## Verification
 
-1. **Frontend path in `main.py`** — `frontend_dir` is derived from `__file__`
-   (`os.path.dirname(__file__)`). If `main.py` moves into `app/`, this must walk
-   up one more level, or it will look for `app/frontend`.
-2. **Entrypoints** — `Dockerfile` (`main:app`), `docker-compose.prod.yml`
-   (`main:app`, `worker.py`), `docker-compose.yml`, `start.ps1` (`main:app`).
-3. **CI** — `.github/workflows/ci.yml` mypy step hardcodes the flat module list.
-4. **Alembic** — `alembic/env.py` and `versions/20260629_0001_baseline_schema.py`
-   import from `database`; migration files are historically frozen, so prefer a
-   compatibility shim or update them deliberately.
-5. **Config** — `mypy.ini` package bases, `pyproject.toml` coverage sources.
-
-### Verification
-`python -m pytest --collect-only -q` catches every broken import (baseline: 104
-tests collect). Follow with the full unit run; integration tests require Postgres.
+`python -m pytest --collect-only -q` catches every broken import. Follow with
+the full unit run (`python -m pytest --ignore=tests/integration`); integration
+tests require Postgres/pgvector.

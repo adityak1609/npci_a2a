@@ -9,11 +9,10 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
 from sqlalchemy.orm import Session
 
-from config import env_int
+from core.config import env_int
 from database import (
     A2ANonce,
     AuditLog,
@@ -21,7 +20,6 @@ from database import (
     ChatSession,
     LoginFailure,
     RevokedSession,
-    SessionLocal,
     User,
 )
 

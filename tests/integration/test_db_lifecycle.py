@@ -1,12 +1,12 @@
 """Integration tests using Testcontainers for a real PostgreSQL database with pgvector."""
 
 import pytest
-from testcontainers.postgres import PostgresContainer
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
+from testcontainers.postgres import PostgresContainer
 
 from database import Base, DocumentChunk
-from embedding_config import embedding_dim
+from rag.embedding_config import embedding_dim
 
 # Match the ORM's configured pgvector dimension so inserts are schema-valid.
 EMBEDDING_DIM = embedding_dim()

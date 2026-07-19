@@ -1,13 +1,14 @@
 """Feedback API routes for chat messages."""
 
 import html
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from auth import User, get_current_user
 from database import ChatMessage, ChatSession, MessageFeedback, get_db
-from pydantic import BaseModel
-from typing import Optional
+from security.auth import User, get_current_user
 
 router = APIRouter()
 

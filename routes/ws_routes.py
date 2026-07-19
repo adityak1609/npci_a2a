@@ -5,10 +5,10 @@ import os
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, status
 
-from auth import get_current_admin
 from database import SessionLocal, User, WebSocketTicket, get_db
+from security.auth import get_current_admin
 from ws.manager import manager
 
 router = APIRouter()

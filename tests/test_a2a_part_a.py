@@ -6,17 +6,16 @@ idempotency keys, dispatcher coverage, and the outbound envelope builder.
 
 import pytest
 
-from a2a_models import (
-    A2ATaskType,
+from a2a_core import state as a2a_state
+from a2a_core.audit import compute_business_key_marker
+from a2a_core.models import (
     A2AErrorCode,
+    A2ATaskType,
     BlockerPayload,
     ClarificationResponsePayload,
     CounterDecisionPayload,
     QueryPayload,
 )
-from a2a_audit import compute_business_key_marker
-import a2a_state
-
 
 PART_A = [
     "change_communication", "proposal_acknowledged", "change_acknowledgement",

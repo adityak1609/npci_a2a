@@ -45,11 +45,8 @@ jobs:
       - name: Type check (mypy)
         run: |
           python -m mypy \
-            main.py auth.py guardrails.py a2a_auth.py \
-            a2a_audit.py a2a_models.py a2a_state.py \
-            config.py compliance.py metrics.py rate_limit.py \
-            retriever.py ingest.py prompt.py csrf.py \
-            secrets_loader.py file_validation.py \
+            main.py \
+            core/ security/ a2a_core/ rag/ \
             agent/ routes/ services/ ws/ \
             --config-file mypy.ini
 

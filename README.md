@@ -74,13 +74,20 @@ TypeScript + Tailwind.
 NPCI_A2A/
 ├── main.py                  # FastAPI app: middleware, CSP, routers, lifespan
 ├── worker.py                # Out-of-process ingestion worker (prod)
+├── a2a_adk_server.py        # Bank's Google-A2A (ADK) server (port 8002)
 ├── database.py              # SQLAlchemy engine, ORM models, init_db
-├── auth.py                  # Users, JWT issue/revoke, role dependencies
-├── a2a_models.py            # A2A envelope + payload schemas (spec v1.0)
-├── a2a_auth.py              # HMAC / mTLS / JWT credential binding
-├── a2a_state.py             # Task + idempotency state
-├── a2a_audit.py             # Append-only A2A audit trail
-├── retriever.py / ingest.py / prompt.py / guardrails.py   # RAG pipeline
+├── core/                    # config+logging, secrets, metrics, telemetry, utils
+├── security/
+│   ├── auth.py              # Users, JWT issue/revoke, role dependencies
+│   ├── guardrails.py        # LLM input/output guardrails
+│   └── csrf.py, rate_limit.py, file_validation.py, compliance.py
+├── a2a_core/                # NPCI A2A protocol layer ("a2a" name is taken by the Google SDK)
+│   ├── models.py            # A2A envelope + payload schemas (spec v1.0)
+│   ├── auth.py              # HMAC / mTLS / JWT credential binding
+│   ├── state.py             # Task + idempotency state
+│   └── audit.py             # Append-only A2A audit trail
+├── rag/
+│   └── retriever.py / ingest.py / prompt.py / embedding_config.py   # RAG pipeline
 ├── agent/
 │   ├── methods.py           # /a2a/internal JSON-RPC method names
 │   ├── dispatcher.py        # Internal dispatch: query_rag, escalate, …

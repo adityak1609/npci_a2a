@@ -86,30 +86,30 @@ NPCI_A2A/
 ├── worker.py               # Out-of-process ingestion worker (A2A_INGESTION_MODE=worker)
 ├── a2a_adk_server.py       # Bank's Google-A2A (ADK) server entrypoint (separate process, port 8002)
 │
-├── config.py               # Env helpers, JSON logging, model list, retry policy
+├── core/config.py               # Env helpers, JSON logging, model list, retry policy
 ├── database.py             # SQLAlchemy engine, ORM models, init_db, audit hash-chain hooks
-├── secrets_loader.py       # Load *_FILE secrets into the environment
-├── embedding_config.py     # Shared embedding dimensionality
-├── telemetry.py            # OpenTelemetry tracing setup
-├── metrics.py              # Prometheus metrics (multiprocess-aware)
-├── csrf.py                 # Origin/Referer CSRF guard for cookie-auth routes
-├── rate_limit.py           # Rate limiting for sensitive endpoints
-├── utils.py                # Shared helpers
+├── core/secrets_loader.py       # Load *_FILE secrets into the environment
+├── rag/embedding_config.py     # Shared embedding dimensionality
+├── core/telemetry.py            # OpenTelemetry tracing setup
+├── core/metrics.py              # Prometheus metrics (multiprocess-aware)
+├── security/csrf.py                 # Origin/Referer CSRF guard for cookie-auth routes
+├── security/rate_limit.py           # Rate limiting for sensitive endpoints
+├── core/utils.py                # Shared helpers
 │
-├── auth.py                 # Passwords, JWT issue/revoke, MFA, role dependencies
+├── security/auth.py                 # Passwords, JWT issue/revoke, MFA, role dependencies
 │
-├── a2a_models.py           # A2A envelope + all Part A payload schemas + enums
-├── a2a_auth.py             # 8-layer /a2a/external authentication chain
-├── a2a_state.py            # Change / cert state machines, idempotency helpers
-├── a2a_audit.py            # A2A message audit + idempotency claim/complete
+├── a2a_core/models.py           # A2A envelope + all Part A payload schemas + enums
+├── a2a_core/auth.py             # 8-layer /a2a/external authentication chain
+├── a2a_core/state.py            # Change / cert state machines, idempotency helpers
+├── a2a_core/audit.py            # A2A message audit + idempotency claim/complete
 │
-├── retriever.py            # Query embedding + pgvector cosine retrieval (+ score/confidence)
-├── ingest.py               # PDF → text → chunks → embeddings → Postgres
-├── prompt.py               # Grounded system prompt construction
-├── guardrails.py           # 3-tier prompt-injection defense + sanitizers
+├── rag/retriever.py            # Query embedding + pgvector cosine retrieval (+ score/confidence)
+├── rag/ingest.py               # PDF → text → chunks → embeddings → Postgres
+├── rag/prompt.py               # Grounded system prompt construction
+├── security/guardrails.py           # 3-tier prompt-injection defense + sanitizers
 │
-├── compliance.py           # External-AI data-processing approval gate
-├── file_validation.py      # Validate uploads (magic bytes, size) before processing
+├── security/compliance.py           # External-AI data-processing approval gate
+├── security/file_validation.py      # Validate uploads (magic bytes, size) before processing
 ├── audit_export.py         # Export + verify append-only audit logs
 │
 ├── routes/                 # FastAPI routers
@@ -288,11 +288,13 @@ All tables are SQLAlchemy models in `database.py`. Grouped by concern:
 
 ## 6. RAG subsystem
 
-### 6.1 Ingestion pipeline (`ingest.py`, `services/a2a_ingestor.py`)
+### 6.1 Ingestion pipeline (`rag/ingest.py`, `services/a2a_ingestor.py`)
 
 ```
 PDF/file → PyMuPDF text extraction
-        → (optional) Gemini vision over rendered pages (USE_VISION)
+        → (optional) hybrid OCR over embedded images (A2A_INGEST_USE_VISION):
+          local Tesseract behind the 5-factor quality gate, Gemini Vision
+          only for images the gate rejects
         → overlapping semantic chunking (~800 tok, ~100 overlap)
         → sanitize suspicious in-document instructions
         → gemini-embedding-001 (retry + backoff, throttled)
@@ -300,7 +302,7 @@ PDF/file → PyMuPDF text extraction
         → insert chunks + vectors into PostgreSQL
 ```
 
-Ingestion is triggered by: CLI (`python ingest.py`), authenticated `POST
+Ingestion is triggered by: CLI (`python rag/ingest.py`), authenticated `POST
 /ingest`, admin upload, the Watchdog file watcher (debounced, bounded sequential
 queue), or an inbound A2A `change_communication` / document message.
 
@@ -312,7 +314,7 @@ hashes are never re-ingested. Failed jobs are retryable via
 `POST /ingestion-jobs/{job_id}/retry`. Lifecycle status:
 `queued → processing → extracting → embedding → ready | failed`.
 
-### 6.2 Retrieval (`retriever.py`)
+### 6.2 Retrieval (`rag/retriever.py`)
 
 The question is embedded with the same model used at ingestion, compared via the
 pgvector cosine operator `<=>` over an HNSW index, and the top-K chunks are
@@ -329,7 +331,7 @@ If confidence is below `A2A_CONFIDENCE_THRESHOLD`, `/chat/stream` emits a
 `low_confidence` SSE event, **skips Gemini generation**, and surfaces the "Raise
 to NPCI" action instead of guessing.
 
-### 6.3 Grounded generation & prompt (`prompt.py`)
+### 6.3 Grounded generation & prompt (`rag/prompt.py`)
 
 Retrieved chunks are labeled `[Chunk N]` and injected as the only allowed
 context. The system prompt instructs the model to answer strictly from context,
@@ -338,7 +340,7 @@ silently, and remain an informational assistant (not an approver or legal
 authority). Up to 5 recent user/assistant pairs are included as memory
 (sanitized to reduce memory-poisoning).
 
-### 6.4 Guardrails (`guardrails.py`) — defense in depth
+### 6.4 Guardrails (`security/guardrails.py`) — defense in depth
 
 | Tier | Mechanism | Catches |
 | --- | --- | --- |
@@ -368,7 +370,7 @@ and reveals text at animation-frame cadence.
 ## 7. A2A protocol subsystem
 
 The A2A surface is the system's defining feature. It is modeled on the **NPCI
-Unified AgentNxt A2A Protocol v1.0** (`a2a_models.py`).
+Unified AgentNxt A2A Protocol v1.0** (`a2a_core/models.py`).
 
 ### 7.1 Two endpoints, two trust levels
 
@@ -402,7 +404,7 @@ state, advance the change state machine, ingest product-kit documents), while
 **Bank-originated types are validate-and-ack on loopback**. Certification (Part
 B, `cert_*`) task types are modeled but return `not_implemented`.
 
-### 7.4 The 8-layer external auth chain (`a2a_auth.py`)
+### 7.4 The 8-layer external auth chain (`a2a_core/auth.py`)
 
 `a2a_external_auth` is a FastAPI dependency on `/a2a/external`. Each layer
 short-circuits with the exact spec error-code string (so NPCI SOC tooling and
@@ -421,7 +423,7 @@ mTLS and JWT-required enforcement are gated to production so the plain-HTTP mock
 agent works locally. Partner/agent/fingerprint bindings come from env maps
 (`A2A_MTLS_PARTNER_MAP`, `A2A_JWT_PARTNER_MAP`, `A2A_KNOWN_AGENTS`, …).
 
-### 7.5 Idempotency & audit (`a2a_audit.py`, `a2a_state.py`)
+### 7.5 Idempotency & audit (`a2a_core/audit.py`, `a2a_core/state.py`)
 
 Each external handler is wrapped: **claim idempotency key** (transport
 `message_id` + business key) → execute handler → advance state on success →
@@ -474,7 +476,7 @@ idempotency, state machine, and audit.
 
 ## 8. Authentication & authorization
 
-- **Passwords** (`auth.py`) — bcrypt, but every password is SHA-256+base64
+- **Passwords** (`security/auth.py`) — bcrypt, but every password is SHA-256+base64
   pre-hashed first so passphrases over bcrypt's 72-byte ceiling keep full
   entropy. A password policy is enforced at registration.
 - **JWT** — HS256 (`SECRET_KEY`) or RS256 (`AUTH_PRIVATE_KEY`/`AUTH_PUBLIC_KEY`
@@ -499,16 +501,16 @@ idempotency, state machine, and audit.
 | Control | Where |
 | --- | --- |
 | Strict CSP w/ per-request nonce, no inline JS/CSS | `security_headers_middleware`, `_inject_csp_nonce` |
-| CSRF Origin/Referer validation on cookie routes | `csrf.py` |
-| Rate limiting on sensitive endpoints | `rate_limit.py` |
+| CSRF Origin/Referer validation on cookie routes | `security/csrf.py` |
+| Rate limiting on sensitive endpoints | `security/rate_limit.py` |
 | Fail-fast unsafe-config validation | `main._validate_security_config` |
-| Upload validation (magic bytes, size, extension) | `file_validation.py` |
-| External-AI data-processing approval gate | `compliance.py` |
-| Prompt-injection defense (3 tiers) + sanitizers | `guardrails.py` |
+| Upload validation (magic bytes, size, extension) | `security/file_validation.py` |
+| External-AI data-processing approval gate | `security/compliance.py` |
+| Prompt-injection defense (3 tiers) + sanitizers | `security/guardrails.py` |
 | Append-only hash-chained audit for admin + A2A | `database.py` hooks + triggers |
 | Notify-list allowlisting (no arbitrary outbound email) | `A2A_NOTIFY_*` + `email_notify.py` |
-| Secrets from files, never source | `secrets_loader.py`, `*_FILE` envs |
-| mTLS in/out, CIDR allowlist, HMAC replay protection | `a2a_auth.py`, Nginx |
+| Secrets from files, never source | `core/secrets_loader.py`, `*_FILE` envs |
+| mTLS in/out, CIDR allowlist, HMAC replay protection | `a2a_core/auth.py`, Nginx |
 
 Inbound NPCI reply auto-ingestion is opt-in (`NPCI_REPLY_AUTO_INGEST`); when off,
 replies are stored `pending_review` for admin approval before becoming RAG
@@ -597,12 +599,12 @@ FastAPI also serves Swagger UI (`/docs`), ReDoc (`/redoc`), and OpenAPI
 
 ## 13. Observability
 
-- **Metrics** (`metrics.py`) — Prometheus counters/histograms
+- **Metrics** (`core/metrics.py`) — Prometheus counters/histograms
   (`http_requests_total`, `http_request_duration_seconds`, …), multiprocess-aware
   for Gunicorn; scraped via `/metrics`. Grafana dashboards + Prometheus alert
   rules in `deploy/`.
-- **Tracing** (`telemetry.py`) — OpenTelemetry spans configured on the app.
-- **Logging** (`config.py`) — process-wide **JSON logs** to stdout with a
+- **Tracing** (`core/telemetry.py`) — OpenTelemetry spans configured on the app.
+- **Logging** (`core/config.py`) — process-wide **JSON logs** to stdout with a
   per-request `request_id` (from `X-Request-ID` or generated), suited to
   container log collectors.
 
@@ -637,7 +639,7 @@ FastAPI also serves Swagger UI (`/docs`), ReDoc (`/redoc`), and OpenAPI
 | `CORS_ORIGINS` | Allowed browser origins (HTTPS-only in prod) |
 
 Any variable may be supplied via a `*_FILE` path (Docker/K8s secrets), loaded by
-`secrets_loader.py`.
+`core/secrets_loader.py`.
 
 ---
 

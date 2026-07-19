@@ -3,17 +3,15 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-import fitz
 from google import genai
 from sqlalchemy import text
 
-from compliance import require_external_ai_approval
 from database import (
     A2AIngestionJob,
     AuditLog,
@@ -22,15 +20,21 @@ from database import (
     ReceivedDocument,
     SessionLocal,
 )
-from file_validation import (
+from rag.ingest import (
+    chunk_parent_child,
+    extract_text_from_pdf_bytes,
+    generate_embeddings,
+)
+from security.compliance import require_external_ai_approval
+from security.file_validation import (
     FileValidationError,
     decode_base64_limited,
     validate_ingest_bytes,
 )
-from ingest import chunk_text, generate_embeddings
 from services.a2a_vision import extract_image_text
 from services.email_notify import send_ingest_email
 
+logger = logging.getLogger(__name__)
 
 RECEIVED_DIR = Path("data") / "a2a_received"
 
@@ -48,22 +52,16 @@ def _json_dumps(value: dict) -> str:
     return json.dumps(value, separators=(",", ":"), default=str)
 
 
-def _extract_pdf_text(content: bytes) -> str:
-    """Extract text from received PDF bytes."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
-    try:
-        doc = fitz.open(tmp_path)
-        try:
-            return "\n\n".join(page.get_text("text") for page in doc).strip()
-        finally:
-            doc.close()
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+def _extract_pdf_text(content: bytes, client: genai.Client | None = None) -> str:
+    """Extract text, structured tables, and visual content from received PDF bytes.
+
+    Delegates to the shared rag.ingest extractor so inbound NPCI documents get
+    the same treatment as locally ingested ones: PyMuPDF table reconstruction
+    (always local) plus the hybrid Tesseract/Gemini-Vision path for embedded
+    images and scanned pages when A2A_INGEST_USE_VISION is on and a client is
+    supplied.
+    """
+    return extract_text_from_pdf_bytes(content, client=client)
 
 
 def _summarize_text(client: genai.Client, text: str) -> str:
@@ -140,7 +138,7 @@ def _store_processed_document(
     source: str,
     file_type: str,
     metadata: dict,
-    chunks: list[str],
+    chunks: list[dict],
     embeddings: list[list[float]],
     summary: str,
     change_id: str | None = None,
@@ -163,8 +161,10 @@ def _store_processed_document(
                 document_id=document_id,
                 source_file=source_file,
                 chunk_index=idx,
-                text=chunk,
+                text=chunk["text"],
                 embedding=embedding,
+                parent_key=chunk.get("parent_key"),
+                parent_text=chunk.get("parent_text"),
                 source=source,
                 content_type=file_type,
                 source_doc=filename,
@@ -213,9 +213,19 @@ async def process_ingestion_job(job_id: int) -> None:
 
     try:
         content = await asyncio.to_thread(Path(stored_path).read_bytes)
+
+        # Build the client up front: PDF extraction may need it for the Gemini
+        # Vision fallback on gate-rejected images (embeddings/summaries need it
+        # regardless). Table extraction and Tesseract OCR stay local either way.
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise OSError("GOOGLE_API_KEY not set.")
+        require_external_ai_approval("A2A document extraction, embeddings, and summaries")
+        client = genai.Client(api_key=api_key)
+
         _set_job_status(job_id, "extracting")
         if file_type == "pdf":
-            text = await asyncio.to_thread(_extract_pdf_text, content)
+            text = await asyncio.to_thread(_extract_pdf_text, content, client)
         elif file_type == "image":
             text = await asyncio.to_thread(extract_image_text, content)
         else:
@@ -224,15 +234,11 @@ async def process_ingestion_job(job_id: int) -> None:
         if not text.strip():
             raise ValueError("No text could be extracted from the document.")
 
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            raise EnvironmentError("GOOGLE_API_KEY not set.")
-        require_external_ai_approval("A2A document embeddings and summaries")
-        client = genai.Client(api_key=api_key)
-
-        chunks = chunk_text(text)
+        chunks = chunk_parent_child(text)
         _set_job_status(job_id, "embedding")
-        embeddings = await asyncio.to_thread(generate_embeddings, chunks, client)
+        embeddings = await asyncio.to_thread(
+            generate_embeddings, [c["text"] for c in chunks], client
+        )
         summary = await asyncio.to_thread(_summarize_text, client, text)
 
         doc_id, chunk_count = await asyncio.to_thread(
@@ -257,7 +263,7 @@ async def process_ingestion_job(job_id: int) -> None:
             try:
                 await asyncio.to_thread(send_ingest_email, filename, metadata, summary, recipients)
             except Exception as notify_exc:
-                print(f"[a2a] Ingestion job {job_id} ready but notification failed: {notify_exc}")
+                logger.warning("Ingestion job %s ready but notification failed: %s", job_id, notify_exc)
                 _db = SessionLocal()
                 try:
                     _db.add(AuditLog(
@@ -270,7 +276,7 @@ async def process_ingestion_job(job_id: int) -> None:
                 finally:
                     _db.close()
 
-        print(f"[a2a] Ingestion job {job_id} ready: doc={doc_id}, chunks={chunk_count}")
+        logger.info("Ingestion job %s ready: doc=%s, chunks=%s", job_id, doc_id, chunk_count)
     except Exception as exc:
         db = SessionLocal()
         try:
@@ -316,14 +322,14 @@ def _task_done_callback(job_id: int, task: asyncio.Task) -> None:
     """Callback attached to every ingestion task for cleanup + error logging."""
     _active_tasks.pop(job_id, None)
     if task.cancelled():
-        print(f"[a2a] Ingestion task for job {job_id} was cancelled.")
+        logger.warning("Ingestion task for job %s was cancelled.", job_id)
         return
     exc = task.exception()
     if exc:
         # The exception was already handled inside process_ingestion_job
         # (which sets job status to "failed"), but log it here as a safety net
         # so it never vanishes silently.
-        print(f"[a2a] Ingestion task for job {job_id} raised: {exc!r}")
+        logger.error("Ingestion task for job %s raised: %r", job_id, exc)
 
 
 def _schedule_job(job_id: int) -> None:
@@ -398,7 +404,7 @@ async def recover_orphaned_jobs() -> int:
             db.commit()
     except Exception as exc:
         db.rollback()
-        print(f"[startup] Failed to recover orphaned jobs: {exc}")
+        logger.exception("Startup: failed to recover orphaned jobs")
     finally:
         db.close()
 
@@ -533,7 +539,7 @@ async def handle_ingest(params: dict) -> dict:
 
 def _prepare_change_documents(cc, change_id: str, version: int) -> list[dict]:
     """Validate every product_kit entry before any DB or filesystem writes."""
-    from a2a_models import DocTypeEnum
+    from a2a_core.models import DocTypeEnum
 
     prepared = []
     for entry in cc.product_kit:
@@ -824,11 +830,11 @@ _active_change_tasks: dict[str, asyncio.Task] = {}
 def _task_done_change_callback(change_id: str, task: asyncio.Task) -> None:
     _active_change_tasks.pop(change_id, None)
     if task.cancelled():
-        print(f"[a2a] Change processing task for {change_id} was cancelled.")
+        logger.warning("Change processing task for %s was cancelled.", change_id)
         return
     exc = task.exception()
     if exc:
-        print(f"[a2a] Change processing task for {change_id} raised: {exc!r}")
+        logger.error("Change processing task for %s raised: %r", change_id, exc)
 
 
 def _schedule_received_change(change_id: str) -> None:
@@ -963,7 +969,7 @@ async def handle_change_communication_ingest(envelope, db_session) -> dict:
     Returns:
         dict with queued document IDs and job IDs
     """
-    from a2a_models import ChangeCommunicationPayload
+    from a2a_core.models import ChangeCommunicationPayload
 
     payload = envelope.payload
     try:
@@ -1022,7 +1028,7 @@ async def _auto_fire_proposal_acknowledged(change_id: str, version: int, force: 
     """
     import uuid
 
-    from a2a_models import A2AEnvelope, ProposalAcknowledgedPayload
+    from a2a_core.models import ProposalAcknowledgedPayload
 
     # Check if already acknowledged
     db = SessionLocal()
@@ -1078,7 +1084,7 @@ async def _auto_fire_proposal_acknowledged(change_id: str, version: int, force: 
     # Log as outbound
     db = SessionLocal()
     try:
-        from a2a_audit import log_a2a_message
+        from a2a_core.audit import log_a2a_message
         log_a2a_message(
             db,
             message_id=message_id,
@@ -1161,7 +1167,7 @@ async def _auto_fire_change_acknowledgement(change_id: str, version: int, force:
 
     db = SessionLocal()
     try:
-        from a2a_audit import log_a2a_message
+        from a2a_core.audit import log_a2a_message
         log_a2a_message(
             db,
             message_id=message_id,

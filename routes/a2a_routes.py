@@ -9,20 +9,18 @@
 import json
 import mimetypes
 import os
-import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
 from jose import JWTError
 from sqlalchemy.orm import Session
 
-from a2a_audit import log_a2a_message, log_a2a_rejection
-from a2a_auth import A2AAuthContext, A2AAuthError, a2a_external_auth
-from a2a_models import A2AEnvelope
+from a2a_core.audit import log_a2a_rejection
+from a2a_core.auth import A2AAuthError, a2a_external_auth
 from agent import methods
 from agent.dispatcher import dispatch_rpc
 from agent.errors import INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR, rpc_error
-from auth import AUTH_COOKIE_NAME, decode_token, get_current_admin, get_current_user
+from core.metrics import inc_counter
 from database import (
     A2AChange,
     A2AIngestionJob,
@@ -33,9 +31,9 @@ from database import (
     User,
     get_db,
 )
-from rate_limit import check_a2a_external_rate_limit
+from security.auth import AUTH_COOKIE_NAME, decode_token, get_current_admin, get_current_user
+from security.rate_limit import check_a2a_external_rate_limit
 from services.a2a_ingestor import retry_ingestion_job
-from metrics import inc_counter
 
 router = APIRouter()
 

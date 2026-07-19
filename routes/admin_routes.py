@@ -1,37 +1,48 @@
 """Admin endpoints for document management and dashboards."""
 
+import asyncio
 import json
 import logging
 import os
-import shutil
 import tempfile
-import asyncio
 import time
-from typing import Optional, List
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks, status, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from sqlalchemy import and_, false, func, or_
 from sqlalchemy.orm import Session
-from sqlalchemy import func, desc, or_, and_, false
 
-from auth import User, get_current_admin, get_current_user, hash_password, validate_password_strength
+from agent.dispatcher import _generate_content_once
+from core.config import env_bool
+from core.metrics import observe_histogram, time_request
+from core.telemetry import _log_internal_error
+from core.utils import format_utc_datetime
 from database import (
-    AuditLog, ChatMessage, ChatSession, DocumentChunk, MessageFeedback, DocumentSummary,
-    A2AChange, A2ABlocker, A2ACounterProposal, A2AMilestone, A2AIngestionJob,
-    ReceivedDocument, NpciTicket, HiddenUpdate, get_db, SessionLocal, engine,
+    A2ABlocker,
+    A2AChange,
+    A2ACounterProposal,
+    A2AIngestionJob,
+    A2AMilestone,
+    AuditLog,
+    ChatMessage,
+    ChatSession,
+    DocumentChunk,
+    DocumentSummary,
+    HiddenUpdate,
+    MessageFeedback,
+    NpciTicket,
+    ReceivedDocument,
+    SessionLocal,
+    get_db,
 )
-from metrics import time_request, inc_counter, observe_histogram
-from config import env_int, env_bool
+from rag.ingest import run_ingestion
+from rag.retriever import invalidate_cache
+from security.auth import User, get_current_admin, get_current_user, hash_password, validate_password_strength
+from security.compliance import ComplianceBlockedError
+from security.file_validation import FileValidationError, max_admin_upload_bytes, validate_pdf_bytes
 from services.retention import anonymize_user_data
-from agent.dispatcher import _generate_content_once, _log_confidence_sample
-from file_validation import FileValidationError, max_admin_upload_bytes, validate_pdf_bytes
-from compliance import ComplianceBlockedError
-from telemetry import _log_internal_error
-from utils import format_utc_datetime
-from ingest import run_ingestion
-from retriever import invalidate_cache
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -187,6 +198,62 @@ async def upload_pdf(
         _log_internal_error("admin_upload_save", e)
         raise HTTPException(status_code=500, detail="Failed to save file.")
 
+    # Durable async mode: enqueue into the same Postgres-backed job queue the
+    # A2A ingestor uses (survives restarts; worker.py claims it in production
+    # via FOR UPDATE SKIP LOCKED, keeping embedding work off the API process).
+    # Default remains synchronous to preserve the portal's response contract.
+    if env_bool("A2A_ADMIN_UPLOAD_ASYNC", default=False):
+        import hashlib as _hashlib
+
+        from services.a2a_ingestor import _schedule_job
+
+        content_hash = _hashlib.sha256(content).hexdigest()
+        existing = (
+            db.query(ReceivedDocument)
+            .filter(ReceivedDocument.content_hash == content_hash)
+            .first()
+        )
+        if existing:
+            _write_audit_log(
+                db, current_admin.id, "upload_pdf", safe_filename,
+                f"duplicate; document_id={existing.id}",
+            )
+            return {
+                "queued": False,
+                "duplicate": True,
+                "document_id": existing.id,
+                "status": existing.status,
+            }
+        received = ReceivedDocument(
+            filename=safe_filename,
+            stored_path=dest_path,
+            content_hash=content_hash,
+            source="admin_upload",
+            file_type="pdf",
+            status="queued",
+            metadata_json=json.dumps({"uploaded_by": current_admin.id}),
+        )
+        db.add(received)
+        db.flush()
+        job = A2AIngestionJob(document_id=received.id, status="queued")
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        _schedule_job(job.id)
+        _write_audit_log(
+            db, current_admin.id, "upload_pdf", safe_filename,
+            f"queued; document_id={received.id}; job_id={job.id}",
+        )
+        if backup_path and os.path.exists(backup_path):
+            os.remove(backup_path)
+        return {
+            "queued": True,
+            "duplicate": False,
+            "document_id": received.id,
+            "job_id": job.id,
+            "status": "queued",
+        }
+
     try:
         result = await asyncio.to_thread(run_ingestion, dest_path)
         invalidate_cache()
@@ -275,7 +342,8 @@ def admin_dashboard(
     Admin only.
     """
     import datetime
-    from sqlalchemy import func, cast, Date
+
+    from sqlalchemy import Date, cast, func
 
     now = datetime.datetime.now(datetime.timezone.utc)
     two_weeks_ago = now - datetime.timedelta(days=13)
@@ -1034,8 +1102,8 @@ async def put_settings(
 @router.post("/admin/settings/test-connection", tags=["Admin - Settings"])
 async def settings_test_connection(current_admin: User = Depends(get_current_admin)):
     """Send an echo to NPCI using the current settings; report reachability."""
-    from services.npci_transport import post_npci_rpc
     from services.npci_outbound import build_outbound_envelope
+    from services.npci_transport import post_npci_rpc
     envelope = build_outbound_envelope("echo", {"ping": "ping"})
     rpc_payload = {"jsonrpc": "2.0", "id": envelope["message_id"], "method": "echo", "params": envelope}
     try:

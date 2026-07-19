@@ -1,11 +1,21 @@
-"""Gemini Vision extraction for A2A image documents."""
+"""Image text extraction for A2A image documents.
+
+Hybrid OCR: local Tesseract runs first behind a 5-factor quality gate
+(services/ocr_gate.py). Only when the gate fails — diagrams, flowcharts,
+low-quality scans — does the image fall back to Gemini Vision, which can
+describe visuals semantically. Gate passes keep the document on-machine
+(no external egress, no API cost)."""
 
 import base64
+import logging
 import os
 
 from google import genai
 
-from compliance import require_external_ai_approval
+from security.compliance import require_external_ai_approval
+from services.ocr_gate import tesseract_extract
+
+logger = logging.getLogger(__name__)
 
 VISION_PROMPT = """You are a document analysis assistant for a financial compliance system.
 Extract ALL visible text from this image verbatim.
@@ -26,11 +36,20 @@ def detect_mime_type(content: bytes) -> str:
 
 
 def extract_image_text(content: bytes) -> str:
-    """agent.ingest_document; params: image bytes; returns extracted image text."""
+    """agent.ingest_document; params: image bytes; returns extracted image text.
+
+    Tesseract-first: a gate pass returns local OCR text with zero egress.
+    Any gate failure falls through to the original Gemini Vision path.
+    """
+    ocr_text, stats = tesseract_extract(content)
+    if ocr_text:
+        logger.info("Tesseract gate passed (%s); skipping Gemini Vision.", stats)
+        return ocr_text
+
     require_external_ai_approval("A2A image OCR/vision extraction")
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
-        raise EnvironmentError("GOOGLE_API_KEY not set.")
+        raise OSError("GOOGLE_API_KEY not set.")
 
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(

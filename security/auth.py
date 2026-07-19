@@ -1,5 +1,5 @@
 """
-auth.py — JWT authentication helpers for Mindgate Policy Bot.
+security/auth.py — JWT authentication helpers for Mindgate Policy Bot.
 
 Provides:
     - Password hashing and verification (bcrypt directly)
@@ -14,18 +14,17 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import bcrypt
 import pyotp
-
 from dotenv import load_dotenv
 from fastapi import Depends, HTTPException, Request, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-import bcrypt
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
+from core.secrets_loader import load_secret_files
 from database import RevokedSession, User, get_db
-from secrets_loader import load_secret_files
 
 load_dotenv()
 load_secret_files()
@@ -42,7 +41,7 @@ if AUTH_PRIVATE_KEY and AUTH_PUBLIC_KEY:
 elif SECRET_KEY:
     ALGORITHM = "HS256"
 else:
-    raise EnvironmentError(
+    raise OSError(
         "No JWT keys configured. Set AUTH_PRIVATE_KEY and AUTH_PUBLIC_KEY for RS256, "
         "or SECRET_KEY for legacy HS256."
     )

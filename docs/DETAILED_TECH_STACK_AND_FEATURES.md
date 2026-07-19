@@ -124,11 +124,11 @@ The design goal is to provide fast, conversational access to internal policy inf
 |---|---|
 | `main.py` | FastAPI application, endpoints, RAG orchestration, streaming, admin operations, and frontend serving |
 | `database.py` | SQLAlchemy engine, database models, indexes, pgvector setup, and session dependency |
-| `auth.py` | Password hashing, JWT creation/validation, user registration, login, and role enforcement |
-| `ingest.py` | PDF extraction, optional visual analysis, chunking, embedding generation, and database persistence |
-| `retriever.py` | Query embedding and pgvector cosine-similarity retrieval |
-| `prompt.py` | Grounded system prompt, security rules, answer rules, and context formatting |
-| `guardrails.py` | Regex checks, semantic classification, input sanitization, document sanitization, and output leak detection |
+| `security/auth.py` | Password hashing, JWT creation/validation, user registration, login, and role enforcement |
+| `rag/ingest.py` | PDF extraction, optional visual analysis, chunking, embedding generation, and database persistence |
+| `rag/retriever.py` | Query embedding and pgvector cosine-similarity retrieval |
+| `rag/prompt.py` | Grounded system prompt, security rules, answer rules, and context formatting |
+| `security/guardrails.py` | Regex checks, semantic classification, input sanitization, document sanitization, and output leak detection |
 | `watcher.py` | Automatic PDF change detection, debouncing, and sequential ingestion |
 | `frontend/index.html` | Login, chat, streaming UI, session history, responsive layout, and admin dashboard |
 | `docker-compose.yml` | Local PostgreSQL 16 and pgvector service |
@@ -230,7 +230,8 @@ Used for:
 
 - Main policy answer generation.
 - Streaming answer generation.
-- Optional visual analysis of PDF pages when `USE_VISION=True`.
+- Optional visual analysis of PDF images when `A2A_INGEST_USE_VISION=true`
+  (only for images the local Tesseract quality gate rejects).
 
 Why it was chosen:
 
@@ -243,7 +244,7 @@ Why it was chosen:
 
 Used for:
 
-- Tier 2 semantic security classification in `guardrails.py`.
+- Tier 2 semantic security classification in `security/guardrails.py`.
 
 Why a separate classifier is useful:
 
@@ -596,7 +597,7 @@ Each user can maintain one feedback record per assistant message. Submitting ano
 
 Ingestion can be triggered through:
 
-- `python ingest.py`
+- `python -m rag.ingest`
 - Authenticated `POST /ingest`
 - Admin PDF upload
 - Watchdog after a PDF is created or modified in `data/`
@@ -671,17 +672,25 @@ This prevents:
 
 ### 6.6 Optional visual understanding
 
-`USE_VISION` is currently `False`.
+`A2A_INGEST_USE_VISION` is `false` by default.
 
-When enabled:
+When enabled, each page's embedded images go through a hybrid OCR path:
 
-1. PyMuPDF renders each page at 150 DPI.
-2. The PNG is sent to Gemini 2.5 Flash.
-3. Gemini describes tables, charts, diagrams, infographics, and embedded text.
-4. The description is appended to the page's extracted text.
+1. PyMuPDF extracts the page's embedded images (normalized to PNG). Pages
+   with no embedded images and no meaningful text layer — vector-drawn
+   scans — are rendered whole at 150 DPI instead.
+2. Local Tesseract OCRs each image first, behind the same 5-factor quality
+   gate used for A2A image ingestion (`services/ocr_gate.py`). A gate pass
+   keeps the image on-machine: no API cost, no data egress.
+3. Only images the gate rejects (charts, diagrams, low-quality scans) are
+   sent to Gemini 2.5 Flash, which describes tables, charts, diagrams,
+   infographics, and embedded text. Tiny images (logos, icons) are skipped
+   without a Gemini call.
+4. The extracted text/description is appended to the page's extracted text.
 5. The combined information is chunked and indexed.
 
-This feature is disabled by default because it increases API usage, latency, and quota requirements.
+The feature is disabled by default because it adds ingestion latency; the
+Tesseract-first gate keeps the API-usage cost of enabling it low.
 
 ---
 
@@ -1435,13 +1444,13 @@ Production recommendation:
 
 | Feature | Frontend | API/orchestration | Supporting module | Storage/external service |
 |---|---|---|---|---|
-| Admin login | Admin login form | `/auth/admin/login` | `auth.py` | PostgreSQL |
-| JWT validation | Auth headers | FastAPI dependencies | `auth.py` | PostgreSQL user lookup |
-| PDF ingestion | Admin upload UI | `/ingest`, `/admin/upload` | `ingest.py` | Gemini + PostgreSQL |
+| Admin login | Admin login form | `/auth/admin/login` | `security/auth.py` | PostgreSQL |
+| JWT validation | Auth headers | FastAPI dependencies | `security/auth.py` | PostgreSQL user lookup |
+| PDF ingestion | Admin upload UI | `/ingest`, `/admin/upload` | `rag/ingest.py` | Gemini + PostgreSQL |
 | Auto-ingestion | None | Lifespan startup | `watcher.py` | Local filesystem |
-| Semantic retrieval | Chat submission | `/chat`, `/chat/stream` | `retriever.py` | Gemini embeddings + pgvector |
-| Grounded answers | Chat messages | RAG orchestration | `prompt.py` | Gemini 2.5 Flash |
-| Guardrails | Error/refusal display | Chat endpoints | `guardrails.py` | Gemini 2.0 Flash |
+| Semantic retrieval | Chat submission | `/chat`, `/chat/stream` | `rag/retriever.py` | Gemini embeddings + pgvector |
+| Grounded answers | Chat messages | RAG orchestration | `rag/prompt.py` | Gemini 2.5 Flash |
+| Guardrails | Error/refusal display | Chat endpoints | `security/guardrails.py` | Gemini 2.0 Flash |
 | Streaming | Smooth message renderer | `/chat/stream` | `main.py` queue/generator | Gemini stream |
 | Legacy feedback compatibility | None in active UI | `/feedback/{message_id}` | `main.py`, `database.py` | PostgreSQL |
 | Chat memory | Session UI | History loading | `main.py`, `database.py` | PostgreSQL |
@@ -1452,7 +1461,7 @@ Production recommendation:
 | Failed ingestion retry | Inbox retry button | `/ingestion-jobs/{job_id}/retry` | `services/a2a_ingestor.py` | PostgreSQL |
 | NPCI tickets | Inbox tab | `/npci-tickets` | `services/npci_client.py`, `services/npci_reply.py` | PostgreSQL + WebSocket |
 | Admin analytics | Dashboard charts/tables | `/admin/dashboard` | `main.py` SQL aggregates | PostgreSQL |
-| PDF management | PDF cards/upload panel | `/admin/pdfs/*` | `main.py`, `ingest.py` | Filesystem + PostgreSQL |
+| PDF management | PDF cards/upload panel | `/admin/pdfs/*` | `main.py`, `rag/ingest.py` | Filesystem + PostgreSQL |
 
 ---
 

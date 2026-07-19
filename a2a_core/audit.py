@@ -1,5 +1,5 @@
 """
-a2a_audit.py — Centralized A2A message audit logging and idempotency checks.
+a2a_core/audit.py — Centralized A2A message audit logging and idempotency checks.
 
 Every accepted AND rejected A2A message gets a row in the ``a2a_messages``
 table (spec §10).  This module also provides transport-level and business-key
@@ -9,15 +9,18 @@ idempotency lookups.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from a2a_models import A2AEnvelope, A2ATaskType
+from a2a_core.models import A2AEnvelope, A2ATaskType
 from database import A2AIdempotencyKey, A2AMessage
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +89,7 @@ def log_a2a_message(
         db.refresh(row)
     except Exception as exc:
         db.rollback()
-        print(f"[audit] Failed to log a2a_message (message_id={message_id})")
+        logger.exception("Failed to log a2a_message (message_id=%s)", message_id)
         raise RuntimeError(f"Failed to write A2A audit message {message_id}") from exc
 
     return row

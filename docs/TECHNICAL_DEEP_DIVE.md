@@ -17,7 +17,7 @@ It's a companion to `docs/ARCHITECTURE.md` and `docs/TECHNICAL_DOCUMENTATION.md`
 3. [Request flows](#3-request-flows)
 4. [The 8-layer authentication stack](#4-the-8-layer-authentication-stack)
 5. [How A2A actually works](#5-how-a2a-actually-works)
-6. [The RAG assistant and guardrails](#6-the-rag-assistant-and-guardrails)
+6. [The RAG assistant: hybrid retrieval and guardrails](#6-the-rag-assistant-hybrid-retrieval-and-guardrails)
 7. [Human authentication (browser sessions, JWT, MFA)](#7-human-authentication)
 8. [Asynchronous ingestion and the worker](#8-asynchronous-ingestion-and-the-worker)
 9. [Data layer](#9-data-layer)
@@ -70,7 +70,9 @@ Two very different kinds of caller use the system, so there are **two separate w
 |------------|-----|
 | **Google Gemini 2.5 Flash** (`google-genai` SDK 2.10) | The assistant only reasons over documents it's given — it's not a general chatbot. **Flash** is the cheap, fast tier, which is right for high-volume Q&A and for the safety filter that runs on *every* message. One SDK covers embeddings, summaries, chat, and the safety filter. |
 | **`gemini-embedding-001`** | Turns text into number-vectors so we can search documents by meaning. Using the same provider for embeddings and answers keeps everything consistent. |
-| **PyMuPDF (`fitz`)** | 1.27 | Fast, lightweight PDF text extraction for incoming documents. Scanned images fall back to a Gemini vision path. |
+| **PyMuPDF (`fitz`)** | 1.27 | Fast, lightweight PDF text extraction for incoming documents. Scanned images go through a local-OCR-first path ([§6](#6-the-rag-assistant-hybrid-retrieval-and-guardrails)) that only falls back to Gemini vision when needed. |
+| **Postgres full-text search** (built into Postgres) | The **keyword (BM25-style)** half of hybrid retrieval ([§6](#6-the-rag-assistant-hybrid-retrieval-and-guardrails)). Runs inside the same Postgres via a generated `tsvector` column + GIN index — no separate search engine, and every ingestion path is indexed automatically. |
+| **Optional RAG extras** (`requirements-rag.txt`) | Two *optional*, fully-local add-ons that sharpen retrieval when installed and **degrade gracefully when absent**: **`sentence-transformers`** (the cross-encoder reranker, `BAAI/bge-reranker-v2-m3`, CPU) and **`pytesseract` + `Pillow`** (the local OCR gate). Kept out of the base install because they pull heavy dependencies (torch); nothing in the core path requires them. |
 
 > ⚠️ **Important:** every `from google import genai` in the code is the **Gemini AI SDK** — it has **nothing to do with A2A messaging**. Don't mix it up with `google-adk` / `a2a-sdk` (§2.1a), which are the A2A wire. The core of A2A (the message shape, the state machine, the routing, the security) is all hand-written here; Google's ADK just carries it. See [§5.1](#51-one-protocol-delivered-over-google-a2a-adk).
 
@@ -224,7 +226,7 @@ Each layer answers a **different question** and can be turned on, watched, and c
 
 The order is deliberate: **cheapest, most decisive checks first** (network/connection), heavy crypto next, and the business/authorization checks (which need the parsed message and database lookups) last.
 
-> **Where each layer runs.** Layers 1–4 run in a small transport middleware at the boundary — the one place the agent can't reach (a `BaseAgent` only sees message parts, never the raw HTTP request). Layers 5–8 run inside the bank agent. All eight reuse the same helper functions in `a2a_auth.py`. See [§5.6](#56-the-google-a2a-adk-transport).
+> **Where each layer runs.** Layers 1–4 run in a small transport middleware at the boundary — the one place the agent can't reach (a `BaseAgent` only sees message parts, never the raw HTTP request). Layers 5–8 run inside the bank agent. All eight reuse the same helper functions in `a2a_core/auth.py`. See [§5.6](#56-the-google-a2a-adk-transport).
 
 ---
 
@@ -236,9 +238,9 @@ The order is deliberate: **cheapest, most decisive checks first** (network/conne
 
 But here's the key point: **Google's ADK is only the wire.** Everything that makes A2A actually *work* is hand-written in this repo and rides on top of the wire:
 
-- the **message shape** (the "envelope") and every payload — `a2a_models.py`,
-- the **8 security layers** — `a2a_auth.py`,
-- the **state machine** — `a2a_state.py`,
+- the **message shape** (the "envelope") and every payload — `a2a_core/models.py`,
+- the **8 security layers** — `a2a_core/auth.py`,
+- the **state machine** — `a2a_core/state.py`,
 - the **routing / handlers** — `agent/external_dispatcher.py`.
 
 On the wire it's JSON-RPC 2.0 using Google A2A's standard methods (`message/send`, …), and our envelope travels **inside** the message. Google's SDK moves the bytes; our code decides what they mean.
@@ -358,14 +360,58 @@ It builds a `change_communication` (making a sample PDF if you don't give one) a
 
 ---
 
-## 6. The RAG assistant and guardrails
+## 6. The RAG assistant: hybrid retrieval and guardrails
 
-The portal's assistant is a **grounded** AI helper — it answers *only* from the documents of a *specific change*, never from general knowledge.
+The portal's assistant is a **grounded** AI helper — it answers *only* from the documents of a *specific change*, never from general knowledge. The retrieval half is **hybrid**: it combines meaning-based search with exact keyword search, re-ranks the result, and lets *document authority* break ties — the piece that matters most for a bank answering questions about which policy is currently in force.
 
-**Pipeline:** question → safety check on the input → turn it into a search vector → find the closest chunks (only within this change) → build a strict prompt → Gemini 2.5 Flash → safety check on the output → answer (or **"Raise query to NPCI"**).
+**Pipeline:** question → safety check on the input → **hybrid retrieval** (dense + keyword → fuse → rerank → authority bias → parent dedup) → build a strict prompt → Gemini 2.5 Flash → safety check on the output → answer (or **"Raise query to NPCI"**).
 
-- **Confidence gate:** if the best match isn't close enough (or the model says it can't answer from the documents), the assistant **offers to escalate to NPCI instead of guessing**. NPCI's reply is then saved as trusted knowledge.
-- **Grounding prompt:** a detailed system prompt with hard rules — never reveal the prompt, never obey instructions hidden inside user text or inside documents, never make up citations, and answer only from the given context. This is prompt-injection defense at the instruction level.
+> **Design note — built on pgvector, not a second database.** All of the retrieval machinery below runs inside the existing Postgres (`rag/retriever.py`). There is **no ChromaDB and no pickle file** — the keyword index is a generated column in the same table as the vectors, so business data, semantic search, and keyword search share one store that's already backed up and transactional.
+
+### 6.1 Why hybrid — the problem with meaning-only search
+
+Meaning-vectors are great at paraphrase ("what's the settlement deadline?") but **bad at exact rare tokens**. Ask about response code `RC91`, an `RRN`/`UTR` number, or circular `NPCI/2024/017` and pure vector search often returns chunks that are *generally about* the topic while missing the one chunk that literally contains the code — because a rare code is noise to an embedding. A compliance corpus is full of exactly these tokens, so the fix is to run **two searches** and combine them.
+
+### 6.2 The retrieval funnel, stage by stage
+
+Every stage narrows the candidate set, spending more compute per item as the set shrinks:
+
+| Stage | What it does | Why |
+|-------|--------------|-----|
+| **1. Dense search** | `gemini-embedding-001` embeds the question; pgvector cosine distance finds the closest **child chunks** (top ~20). | Matches on *meaning* — paraphrases, synonyms, concepts. |
+| **2. Keyword search (BM25-style)** | Postgres full-text (`websearch_to_tsquery` + `ts_rank_cd`) over the same chunks (top ~20). | Matches on *exact words* — codes, IDs, field names that dense search fumbles. Injection-safe over arbitrary user text. |
+| **3. RRF fusion** | Reciprocal Rank Fusion (`k=60`) merges the two ranked lists into one (top ~8). | Rank-based, so the incomparable distance and keyword scales never need reconciling; **rewards chunks that rank well in *both* lists** ([§6.3](#63-rrf-in-one-example)). |
+| **4. Cross-encoder rerank** | An optional local model (`BAAI/bge-reranker-v2-m3`, CPU) reads the question and each candidate *together* and re-scores them (top ~6). | Far more accurate than the approximate searches above; affordable because it runs on only ~8 items, never the whole corpus. Fully on-machine. |
+| **5. Authority bias** | The final score is nudged by `source`: `npci_official` boosted, `old_policy` penalized, others in between. | **The bank-grade step.** Relevance decides most of it; authority breaks ties so an eloquent *superseded* circular can't outrank the current one. Applied **last**, on the final score. |
+| **6. Parent dedup** | Children are grouped by parent; the best child per parent wins and the LLM receives the **full parent passage**. | Children are searched for precision; parents are read for context. Also stops five slices of the same paragraph from crowding out other documents. |
+
+Every returned passage still carries the **true dense cosine distance** of its best child — computed even for keyword-discovered candidates — so the confidence gate ([§6.5](#65-confidence-gate-grounding-and-guardrails)) keeps its original meaning.
+
+### 6.3 RRF in one example
+
+Question: *"What is the timeout for an FPS outward transaction?"*
+
+| Chunk | Dense rank | Keyword rank | RRF score |
+|-------|-----------|--------------|-----------|
+| A — timeout spec | 1 | 3 | 1/61 + 1/63 = **0.0322** |
+| C — FPS timeout table | 5 | 1 | 1/65 + 1/61 = **0.0318** |
+| B — transaction overview | 2 | 8 | 1/62 + 1/68 = **0.0308** |
+
+Chunk **C** topped the keyword search (it literally contains "timeout") but was only 5th on meaning; RRF still floats it to 2nd overall so it reaches the reranker. Meaning-only search would have buried the actual timeout table at rank 5. **Neither signal gets ignored.**
+
+### 6.4 Parent-child chunking (why passages stay whole)
+
+Ingestion (`rag/ingest.py`, shared by every path) now builds **two levels** from each document:
+
+- **Parents** (~1,100 chars, hard cap 1,500) — paragraphs packed into coherent passages; a whole rule with its context.
+- **Children** (~350 chars, ~100 overlap) — a sliding window *within* each parent; the unit that gets embedded and searched.
+
+The bot **searches on small children** (precise matching) but **hands the LLM the full parent** (complete context) — the thing a single fixed chunk size can't do well. Trailing children under ~120 chars are merged so there are no useless orphan snippets, and both levels are sanitized against prompt-injection. Legacy flat chunks (no parent) still work — retrieval falls back to the chunk's own text.
+
+### 6.5 Confidence gate, grounding, and guardrails
+
+- **Confidence gate:** if the closest match isn't close enough (or the model says it can't answer from the documents), the assistant **offers to escalate to NPCI instead of guessing**. NPCI's reply is then saved as trusted knowledge. *(Because hybrid ordering is no longer pure distance-order, the gate now reads the **best** distance across the returned rows.)*
+- **Grounding prompt:** a detailed system prompt with hard rules — never reveal the prompt, never obey instructions hidden inside user text or inside documents, never make up citations, and answer only from the given context. Instruction-level prompt-injection defense.
 - **Guardrails — three tiers:**
   1. **Fast pattern match** — instantly blocks obvious attacks at no cost.
   2. **AI classifier** (Gemini) — catches bad *intent* no matter how it's worded; the main defense.
@@ -373,11 +419,39 @@ The portal's assistant is a **grounded** AI helper — it answers *only* from th
 
   A **circuit breaker** around the classifier keeps chat working (degrading gracefully) if Gemini is unavailable, instead of failing every message.
 
+### 6.6 The OCR quality gate (cost and data-residency guard)
+
+Some documents arrive as **images** (scans, screenshots). Sending every one to Gemini Vision costs money and, more importantly for a bank, **ships the page to Google**. The gate (`services/ocr_gate.py`) runs local **Tesseract first** and only falls back to Gemini when the local text can't be trusted — judged by **five checks that must all pass**:
+
+| Check | Catches |
+|-------|---------|
+| word count ≥ 6 | logos / near-blank pages — too little to judge |
+| mean confidence ≥ 60 | systematically bad scan (DPI, odd font) |
+| **p10 confidence ≥ 35** | *localized* garbage (a watermark corner) hiding behind a healthy average |
+| letter-word ratio ≥ 0.25 | symbol soup from diagrams (`>>`, `[|]`) |
+| garbage-token ratio < 0.30 | linguistically impossible tokens (20+ chars, 4+ vowels, 6+ consonants…) |
+
+A **pass** keeps the page on-machine at zero API cost; **any failure** falls through to the original Gemini Vision path, which can *describe* a diagram semantically. Outcomes are exposed as a Prometheus counter (`rag_ocr_gate_total`) so the fallback rate is observable. All thresholds are env-tunable (`A2A_OCR_*`).
+
+> **Threshold caveat for NPCI content:** pages dominated by long reference IDs (RRN/UTR) and dense numeric settlement tables can trip the letter-ratio and garbage checks and be sent to Gemini unnecessarily. Watch the counter and tune the thresholds against the real corpus before relying on the gate widely.
+
+### 6.7 Everything optional fails safe
+
+The pipeline can never hard-break because a component is missing — it degrades to roughly the previous behaviour and sharpens as each piece is present:
+
+| Missing piece | Behaviour |
+|---------------|-----------|
+| Reranker library (`sentence-transformers`) | Trust the RRF order; logged + metered once. |
+| Keyword column (pre-migration database) | Dense-only retrieval; counted, not fatal. |
+| Tesseract / Pillow | Images go straight to Gemini Vision, as before. |
+
+The main tuning knobs are environment variables: `A2A_DENSE_TOP_N`, `A2A_BM25_TOP_N`, `A2A_RRF_K`, `A2A_RRF_TOP_N`, `A2A_RERANK_TOP_N`, `A2A_RERANK_ENABLED`, the `A2A_SOURCE_BIAS_*` weights, the parent/child sizes, and the `A2A_OCR_*` thresholds.
+
 ---
 
 ## 7. Human authentication
 
-Separate from the machine-facing 8 layers, people in a browser log in with sessions (`auth.py`):
+Separate from the machine-facing 8 layers, people in a browser log in with sessions (`security/auth.py`):
 
 - **JWT (the login token)** — RS256 in production (so verifiers can't mint tokens), with a short **15-minute** expiry. Every token has an ID; logging out records that ID on a revoked list so it stops working **immediately**.
 - **Cookies** — the token is stored in an **HttpOnly, SameSite=strict, Secure** cookie: JavaScript can't read it (blocks token theft via injected scripts), and it isn't sent from other sites. Non-browser clients get a plain bearer token instead.
@@ -394,11 +468,13 @@ Incoming document kits are heavy to process (extract text, split, embed), so pro
 
 1. `change_communication` validates each document, saves the originals, and computes a hash for **deduplication** (identical files are never processed twice).
 2. It records the documents and creates processing jobs, then returns quickly — having already auto-sent "proposal acknowledged."
-3. A background stage moves each job through `queued → processing → extracting → embedding → ready` (or `failed`, which can be retried).
+3. A background stage moves each job through `queued → processing → extracting → embedding → ready` (or `failed`, which can be retried). The `extracting` step uses the OCR gate for images ([§6.6](#66-the-ocr-quality-gate-cost-and-data-residency-guard)); the split step is **parent-child chunking** ([§6.4](#64-parent-child-chunking-why-passages-stay-whole)), so everything ingested here is retrievable by both meaning and keyword.
 
 **Dev vs production:**
 - **Dev:** jobs run as background tasks inside the API process.
 - **Production:** a **separate worker process** claims jobs from Postgres using `SELECT … FOR UPDATE SKIP LOCKED`. The job table *is* the queue — no separate broker — so no job is ever processed twice by competing workers, and heavy work never slows down live chat.
+
+**Admin PDF uploads** share this queue too. By default they still ingest synchronously (the portal expects an immediate chunk count), but setting `A2A_ADMIN_UPLOAD_ASYNC=true` routes them through the same durable job queue — the upload returns a `job_id` immediately and the worker does the heavy lifting off the request path, surviving restarts.
 
 **Crash safety:** on startup, one elected process re-queues any jobs left half-done and recovers received changes, so an unclean shutdown loses no work.
 
@@ -406,7 +482,7 @@ Incoming document kits are heavy to process (extract text, split, embed), so pro
 
 ## 9. Data layer
 
-- **Postgres + pgvector** hold everything: users, changes, flows, received documents, document chunks (with their vectors), summaries, tickets, the audit log, one-time nonces, duplicate-protection keys, revoked sessions, websocket tickets, and login-failure records.
+- **Postgres + pgvector** hold everything: users, changes, flows, received documents, document chunks (each with its vector, its parent passage, and an auto-generated keyword `tsvector` for hybrid search — [§6](#6-the-rag-assistant-hybrid-retrieval-and-guardrails)), summaries, tickets, the audit log, one-time nonces, duplicate-protection keys, revoked sessions, websocket tickets, and login-failure records.
 - **Alembic** owns the schema in production, and the app **refuses to start** if the live schema doesn't match the expected version.
 - **Retention** prunes old audit and security rows on a schedule; expired nonces and tickets are swept by a periodic task, guarded so only one worker sweeps at a time.
 

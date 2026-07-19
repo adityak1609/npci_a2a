@@ -19,8 +19,8 @@ import json
 import uuid
 from datetime import datetime, timezone
 
-from a2a_audit import log_a2a_message
-from a2a_models import (
+from a2a_core.audit import log_a2a_message
+from a2a_core.models import (
     A2AEnvelope,
     A2ATaskType,
     BlockerPayload,
@@ -29,7 +29,7 @@ from a2a_models import (
     MilestoneUpdatePayload,
     ReadinessDeclarationPayload,
 )
-from a2a_state import advance_change_state
+from a2a_core.state import advance_change_state
 from database import A2ABlocker, A2AChange, A2ACounterProposal, A2AMilestone, SessionLocal
 from services.npci_transport import post_npci_rpc
 

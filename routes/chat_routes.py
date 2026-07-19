@@ -17,44 +17,18 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from agent.dispatcher import _get_genai_client
-from auth import User, get_current_admin, get_current_user
-from compliance import ComplianceBlockedError, require_external_ai_approval
-from config import env_int, gemini_models, is_retryable_llm_error
-from database import (
-    A2AIngestionJob,
-    ChatMessage,
-    ChatSession,
-    MessageFeedback,
-    SessionLocal,
-    engine,
-    get_db,
-)
-from guardrails import (
-    VerifiedStreamBuffer,
-    _check_regex,
-    check_input,
-    check_output,
-    classifier_circuit_state,
-    sanitize_question,
-)
-from ingest import run_ingestion
-from metrics import inc_counter, observe_histogram, render_prometheus, set_gauge
-from prompt import build_prompt
-from rate_limit import check_a2a_external_rate_limit, check_chat_rate_limit
-from retriever import index_exists, invalidate_cache, retrieve, retrieve_with_scores
-from routes.auth_routes import require_metrics_access
-from telemetry import _log_internal_error
-from utils import (
+from core.config import env_int, gemini_models, is_retryable_llm_error
+from core.metrics import inc_counter, render_prometheus, set_gauge
+from core.telemetry import _log_internal_error
+from core.utils import (
     _allowed_visibility_tiers,
     _build_gemini_contents,
     _generate_with_retry,
@@ -64,6 +38,30 @@ from utils import (
     _verified_answer_chunks,
     format_utc_datetime,
 )
+from database import (
+    A2AIngestionJob,
+    ChatMessage,
+    ChatSession,
+    SessionLocal,
+    engine,
+    get_db,
+)
+from rag.decompose import decomposed_retrieve_with_scores
+from rag.ingest import run_ingestion
+from rag.prompt import build_prompt
+from rag.retriever import index_exists, invalidate_cache
+from routes.auth_routes import require_metrics_access
+from security.auth import User, get_current_admin
+from security.compliance import ComplianceBlockedError, require_external_ai_approval
+from security.guardrails import (
+    VerifiedStreamBuffer,
+    _check_regex,
+    check_input,
+    check_output,
+    classifier_circuit_state,
+    sanitize_question,
+)
+from security.rate_limit import check_chat_rate_limit
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -260,17 +258,22 @@ async def chat_endpoint(
 
     # 3. Run LLM guardrail + retrieval IN PARALLEL — they are independent
     #    This saves ~1-3 seconds by overlapping the classifier and embedding calls.
+    #    Retrieval decomposes multi-part questions into standalone sub-queries
+    #    retrieved in parallel and RRF-fused (rag/decompose.py).
     guard_task = asyncio.to_thread(check_input, req.question)
     visibility_tiers = _allowed_visibility_tiers(current_user)
-    retrieve_task = asyncio.to_thread(retrieve, clean_question, 5, visibility_tiers)
+    retrieve_task = asyncio.to_thread(
+        decomposed_retrieve_with_scores, clean_question, 5, visibility_tiers
+    )
 
     try:
-        guard, chunks = await asyncio.gather(guard_task, retrieve_task)
+        guard, scored_chunks = await asyncio.gather(guard_task, retrieve_task)
     except FileNotFoundError:
         raise HTTPException(
             status_code=400,
             detail="Policy index not found. Please trigger /ingest first.",
         )
+    chunks = [row["text"] for row in scored_chunks]
 
     # 4. If guardrail blocked, discard retrieval results
     if guard.blocked:
@@ -355,10 +358,14 @@ async def chat_stream_endpoint(
     session = _get_or_create_session(db, req.session_id, current_user)
     history = _load_chat_history(db, session.id)
 
-    # 2. Run LLM guardrail + retrieval IN PARALLEL
+    # 2. Run LLM guardrail + retrieval IN PARALLEL. Retrieval decomposes
+    #    multi-part questions into standalone sub-queries retrieved in
+    #    parallel and RRF-fused (rag/decompose.py).
     guard_task = asyncio.to_thread(check_input, req.question)
     visibility_tiers = _allowed_visibility_tiers(current_user)
-    retrieve_task = asyncio.to_thread(retrieve_with_scores, clean_question, 5, visibility_tiers)
+    retrieve_task = asyncio.to_thread(
+        decomposed_retrieve_with_scores, clean_question, 5, visibility_tiers
+    )
 
     try:
         guard, scored_chunks = await asyncio.gather(guard_task, retrieve_task)
@@ -385,7 +392,9 @@ async def chat_stream_endpoint(
         return StreamingResponse(blocked_stream_llm(), media_type="text/event-stream")
 
     chunks = [row["text"] for row in scored_chunks]
-    best_distance = scored_chunks[0]["distance"] if scored_chunks else float("inf")
+    # Hybrid retrieval orders rows by fused relevance, not raw distance —
+    # confidence gating should still reflect the closest dense match found.
+    best_distance = min((row["distance"] for row in scored_chunks), default=float("inf"))
     scale = float(os.getenv("A2A_EMBEDDING_SCALE", "1.5"))
     threshold = float(os.getenv("A2A_CONFIDENCE_THRESHOLD", "0.45"))
     # Clamp to [0.0, 1.0] — distance > scale gives 0; distance ≈ 0 gives 1.
@@ -497,7 +506,7 @@ async def chat_stream_endpoint(
                         queue.get(),
                         timeout=_HEARTBEAT_INTERVAL_SECONDS,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # No token yet — emit heartbeat and keep waiting
                     yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
                     continue

@@ -14,64 +14,37 @@ middleware, lifespan (migration gate, startup recovery, periodic cleanup), and
 serving the built SPA.
 """
 
-import os
-import re
-import json
-import time
-import secrets as token_secrets
-import shutil
-import tempfile
 import asyncio
 import logging
+import os
+import re
+import secrets as token_secrets
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
-from google import genai
-from google.genai import types
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
-from typing import Optional
+
 from dotenv import load_dotenv
-from datetime import timezone
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
+from google import genai
 
+from core.config import configure_logging, env_bool, env_int, request_id_var
+from core.metrics import inc_counter, observe_histogram, time_request
+from core.secrets_loader import load_secret_files
+from core.telemetry import configure_telemetry
 from database import (
-    init_db, get_db, User, ChatSession, ChatMessage, MessageFeedback,
-    DocumentChunk, DocumentSummary, AuditLog, A2AIngestionJob, SessionLocal, engine
-)
-from auth import (
-    get_current_user, get_current_admin, authenticate_user_for_role,
-    create_access_token, revoke_token, UserLogin, Token, AUTH_COOKIE_NAME
-)
-from config import configure_logging, env_bool, env_int, request_id_var
-from compliance import ComplianceBlockedError, require_external_ai_approval
-from file_validation import FileValidationError, max_admin_upload_bytes, validate_pdf_bytes
-from rate_limit import check_chat_rate_limit, check_rate_limit
-from retriever import retrieve, retrieve_with_scores, index_exists, invalidate_cache
-from prompt import build_prompt
-from ingest import run_ingestion
-
-from guardrails import (
-    VerifiedStreamBuffer,
-    classifier_circuit_state,
-    check_input,
-    check_output,
-    sanitize_question,
-    _check_regex,
+    SessionLocal,
+    init_db,
 )
 from routes.a2a_routes import router as a2a_router
-from routes.ws_routes import router as ws_router
+from routes.admin_routes import router as admin_router
 from routes.auth_routes import router as auth_router
 from routes.chat_routes import router as chat_router
 from routes.sys_routes import router as sys_router
-from routes.admin_routes import router as admin_router
-from metrics import inc_counter, observe_histogram, render_prometheus, set_gauge, time_request
-from telemetry import configure_telemetry
-from csrf import csrf_middleware
-from secrets_loader import load_secret_files
+from routes.ws_routes import router as ws_router
+from security.csrf import csrf_middleware
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -92,7 +65,7 @@ load_secret_files()
 
 google_api_key = os.getenv("GOOGLE_API_KEY")
 if not google_api_key:
-    raise EnvironmentError("GOOGLE_API_KEY not set. Create a .env file with your key.")
+    raise OSError("GOOGLE_API_KEY not set. Create a .env file with your key.")
 
 client = genai.Client(api_key=google_api_key)
 
@@ -123,7 +96,7 @@ def _expected_alembic_head() -> str:
     cfg.set_main_option("script_location", os.path.join(base_dir, "alembic"))
     head = ScriptDirectory.from_config(cfg).get_current_head()
     if not head:
-        raise EnvironmentError("No Alembic head revision found under alembic/versions.")
+        raise OSError("No Alembic head revision found under alembic/versions.")
     return head
 
 # ---------------------------------------------------------------------------
@@ -241,7 +214,7 @@ def _validate_security_config() -> None:
             errors.append("CORS_ORIGINS must contain only explicit HTTPS production origins.")
 
     if errors:
-        raise EnvironmentError("Unsafe security configuration: " + " ".join(errors))
+        raise OSError("Unsafe security configuration: " + " ".join(errors))
 
 
 def _assert_database_migrated() -> None:
@@ -253,7 +226,7 @@ def _assert_database_migrated() -> None:
     try:
         revision = db.execute(text("SELECT version_num FROM alembic_version")).scalar()
     except Exception as exc:
-        raise EnvironmentError(
+        raise OSError(
             "Database is not Alembic-managed. Run `alembic upgrade head` before "
             "starting with APP_ENV=production."
         ) from exc
@@ -261,7 +234,7 @@ def _assert_database_migrated() -> None:
         db.close()
 
     if revision != expected:
-        raise EnvironmentError(
+        raise OSError(
             f"Database migration revision mismatch: expected "
             f"{expected}, found {revision or 'none'}. "
             "Run `alembic upgrade head` before starting production."
@@ -352,7 +325,7 @@ async def lifespan(app: FastAPI):
         _nonce_cleanup_task.cancel()
         try:
             await asyncio.wait_for(_nonce_cleanup_task, timeout=_env_int("SHUTDOWN_GRACE_SECONDS", 30))
-        except (asyncio.CancelledError, asyncio.TimeoutError):
+        except (TimeoutError, asyncio.CancelledError):
             pass
 
 

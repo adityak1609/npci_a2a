@@ -41,14 +41,14 @@ from typing import Optional
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from a2a_auth import (
+from a2a_core.auth import (
     A2AAuthError,
     check_cidr,
     check_mtls,
     verify_hmac,
     verify_jwt_session,
 )
-from config import env_bool
+from core.config import env_bool
 from database import SessionLocal
 
 logger = logging.getLogger(__name__)
@@ -160,8 +160,8 @@ class TransportAuthMiddleware:
         """Log the rejection to a2a_messages + bump the metric (parity with the
         legacy endpoint). Auditing must never mask the real rejection."""
         try:
-            from a2a_audit import log_a2a_rejection
-            from metrics import inc_counter
+            from a2a_core.audit import log_a2a_rejection
+            from core.metrics import inc_counter
 
             inc_counter("a2a_auth_rejections_total", {"error_code": exc.error_code})
             log_a2a_rejection(

@@ -1,5 +1,5 @@
 """
-a2a_state.py — Change and Certification lifecycle state machines (spec §6).
+a2a_core/state.py — Change and Certification lifecycle state machines (spec §6).
 
 Each state machine is defined as an adjacency map (current_state → set of
 valid next states).  A ``task_type_to_target_state`` mapping links each
@@ -12,13 +12,16 @@ Usage:
 
 from __future__ import annotations
 
-from a2a_models import (
+from a2a_core.models import (
     A2ATaskType,
-    ChangeLifecycleState as CLS,
+)
+from a2a_core.models import (
     CertLifecycleState as CERT,
 )
-from database import A2AChange, A2ACflow
-
+from a2a_core.models import (
+    ChangeLifecycleState as CLS,
+)
+from database import A2ACflow, A2AChange
 
 # ---------------------------------------------------------------------------
 # Change lifecycle transitions (spec §6)
@@ -160,7 +163,6 @@ def validate_transition(envelope, db) -> None:
     Raises ValueError with a descriptive message if the transition is invalid.
     Does nothing for stateless task types or task types not in the state machine.
     """
-    from a2a_models import A2AEnvelope  # Avoid circular at module level
 
     task_type = envelope.task_type
 

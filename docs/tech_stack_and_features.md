@@ -147,7 +147,7 @@ Holds processed text fragments and their high-dimensional vector embeddings.
 ## ⚙️ Core System Features & Functioning
 
 ### 1. User Authentication & JWT Protection
-*   **Security Configuration:** Implemented in [auth.py](file:///d:/RAG_PDF_CHATBOT/auth.py).
+*   **Security Configuration:** Implemented in [security/auth.py](file:///d:/RAG_PDF_CHATBOT/auth.py).
 *   **Hashing (Bcrypt):** Plaintext passwords are raw-hashed using `bcrypt.gensalt()` before storage. Plaintext passwords never enter database records.
 *   **Verification:** `bcrypt.checkpw()` verifies incoming credentials by matching candidate strings against the stored hash.
 *   **Token Authorization:** On successful authentication, `/auth/login` returns a JSON Web Token (JWT) signed with the server's `SECRET_KEY` using the `HS256` algorithm.
@@ -161,7 +161,7 @@ Provides autonomous document updates on file drops.
 *   **Debounce Safety:** When an OS modifies a file, it does so in fragments. Watcher instantiates a `threading.Timer` with a **5-second debounce**. If another file write occurs, the timer resets, preventing half-written ingestion.
 *   **Sequential Queue:** Once debounced, files are sent to a thread-safe `queue.Queue` processed by a single background daemon thread. This avoids parallel API floods and rate-limiting blocks.
 
-### 3. PDF Ingestion Pipeline (`ingest.py`)
+### 3. PDF Ingestion Pipeline (`rag/ingest.py`)
 Splits documents into mathematical representations.
 *   **Extraction:** Opens a PDF via PyMuPDF.
 *   **Semantic Chunking:** Loops through lines, accumulating chunks up to 1000 characters. To prevent context division, a 200-character overlap buffer is maintained between consecutive chunks.
@@ -169,12 +169,12 @@ Splits documents into mathematical representations.
 *   **Vector Construction:** The FastAPI app contacts the Gemini embedding service, generating the vector weights.
 *   **Transaction Lock:** Truncates older records matching `source_file` and executes bulk SQL inserts.
 
-### 4. Vector Cosine Retriever (`retriever.py`)
+### 4. Vector Cosine Retriever (`rag/retriever.py`)
 Implements the core search capabilities.
 *   **Vector Conversion:** Embeds incoming questions using the same model (`gemini-embedding-001`).
 *   **Similarity Search:** Performs a cosine distance calculation. PostgreSQL compares the search vector with all table elements, using the `<=>` operator (where a lower distance indicates high similarity). The top 5 closest fragments are returned.
 
-### 5. Multi-Tier Security Guardrails (`guardrails.py`)
+### 5. Multi-Tier Security Guardrails (`security/guardrails.py`)
 To prevent exploitation, user inputs and outputs are processed through three defensive boundaries:
 
 *   **Tier 1: Regex Fast-Path (Input Check)**

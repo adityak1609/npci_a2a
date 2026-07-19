@@ -2,17 +2,13 @@
 Automated RAG Pipeline Evaluation (Path to 10)
 Measures Answer Correctness, Refusal Accuracy, and Citation Fidelity.
 """
-import os
+from unittest.mock import patch
+
 import pytest
-import math
-from unittest.mock import patch, MagicMock
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from database import Base, DocumentChunk
-from retriever import get_relevant_chunks, format_retrieved_context
-from agent.dispatcher import _a2a_generate_chat, _a2a_reject_message
-from ingest import compute_embedding
 
 # Use SQLite memory for simple testing without pgvector dependency in this specific unit eval
 # Note: For real vector search, testcontainers (which we have) is used.
@@ -48,7 +44,7 @@ def mock_db():
     Base.metadata.create_all(engine)
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     db = TestingSessionLocal()
-    
+
     # Mock some chunks
     chunk1 = DocumentChunk(
         source_file="npc_policy.pdf",
@@ -75,14 +71,14 @@ def test_rag_evaluation(mock_db):
     """
     # 1. Evaluate Exact Match / Citation Accuracy
     q1 = GOLDEN_DATASET[0]
-    
+
     # Mocking external LLM call to simulate a perfect Gemini response
     with patch("agent.dispatcher._generate_content_once") as mock_gen:
         mock_gen.return_value = "The timeout for A2A requests is 15 seconds."
-        
+
         # Test the system prompt refusal boundary via mock context
         response = mock_gen([{"role": "user", "parts": [{"text": "Context..."}]}])
-        
+
         for keyword in q1["expected_answer_keywords"]:
             assert keyword in response or keyword in "15 seconds timeout abort" # fallback check
 
@@ -90,11 +86,11 @@ def test_rag_evaluation(mock_db):
     q2 = GOLDEN_DATASET[1]
     # We would run the RAG and check if the agent decides to escalate or refuse.
     assert q2["is_out_of_bounds"] == True
-    
+
     # 3. Prompt Injection (Refusal Accuracy)
     q3 = GOLDEN_DATASET[2]
     # Simulate guardrails catching injection
-    with patch("guardrails.Guardrails.scan_input") as mock_scan:
+    with patch("security.guardrails.Guardrails.scan_input") as mock_scan:
         mock_scan.side_effect = ValueError("Injection detected")
         try:
             mock_scan(q3["question"])

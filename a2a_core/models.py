@@ -1,5 +1,5 @@
 """
-a2a_models.py — Pydantic models derived from the NPCI Unified AgentNxt A2A
+a2a_core/models.py — Pydantic models derived from the NPCI Unified AgentNxt A2A
 Protocol Specification v1.0.
 
 Covers:
@@ -18,7 +18,6 @@ from enum import StrEnum
 from typing import Any, Optional
 
 from pydantic import AliasChoices, BaseModel, Field
-
 
 # ---------------------------------------------------------------------------
 # §6 — task_type enum (Part A fully in scope; Part B retained, out of scope)

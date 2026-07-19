@@ -12,7 +12,6 @@ import time
 
 import httpx
 
-
 BASE_URL = os.getenv("LOAD_TEST_BASE_URL", "http://localhost:8000").rstrip("/")
 TOKEN = os.getenv("LOAD_TEST_TOKEN", "")
 REQUESTS = int(os.getenv("LOAD_TEST_REQUESTS", "100"))

@@ -20,11 +20,10 @@ from agent.errors import (
     rpc_error,
 )
 from database import DocumentSummary
-from guardrails import check_input, check_output, sanitize_question, _check_regex
-from prompt import build_prompt
-from retriever import retrieve_with_scores
+from rag.prompt import build_prompt
+from rag.retriever import retrieve_with_scores
+from security.guardrails import _check_regex, check_input, check_output, sanitize_question
 from services.npci_client import handle_escalate
-
 
 # ---------------------------------------------------------------------------
 # Cached Gemini client (avoid re-creating on every A2A RAG call)
@@ -38,7 +37,7 @@ def _get_genai_client() -> genai.Client:
     if _cached_genai_client is None:
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
-            raise EnvironmentError("GOOGLE_API_KEY not set.")
+            raise OSError("GOOGLE_API_KEY not set.")
         _cached_genai_client = genai.Client(api_key=api_key)
     return _cached_genai_client
 
@@ -209,12 +208,15 @@ async def _query_rag(params: dict) -> dict:
             "message": "No confident answer found.",
         }
 
-    confidence = _confidence(rows[0]["distance"])
+    # Hybrid retrieval orders rows by fused relevance, not raw distance —
+    # confidence gating should still reflect the closest dense match found.
+    best_distance = min(row["distance"] for row in rows)
+    confidence = _confidence(best_distance)
     threshold = float(os.getenv("A2A_CONFIDENCE_THRESHOLD", "0.45"))
     best_change_id = rows[0].get("change_id") if rows else None
 
     if confidence < threshold:
-        _log_confidence_sample(rows[0]["distance"], confidence, threshold, suggest_escalation=True)
+        _log_confidence_sample(best_distance, confidence, threshold, suggest_escalation=True)
         return {
             "answer": None,
             "confidence": round(confidence, 3),
@@ -223,7 +225,7 @@ async def _query_rag(params: dict) -> dict:
             "message": "No confident answer found.",
         }
 
-    _log_confidence_sample(rows[0]["distance"], confidence, threshold, suggest_escalation=False)
+    _log_confidence_sample(best_distance, confidence, threshold, suggest_escalation=False)
 
     client = _get_genai_client()
     prompt = build_prompt([row["text"] for row in rows])
@@ -242,7 +244,7 @@ async def _query_rag(params: dict) -> dict:
     # say so explicitly). Detect those non-answers so the frontend can offer
     # "Raise query to NPCI" instead of presenting a dead end.
     if _is_non_answer(answer):
-        _log_confidence_sample(rows[0]["distance"], confidence, threshold, suggest_escalation=True)
+        _log_confidence_sample(best_distance, confidence, threshold, suggest_escalation=True)
         return {
             "answer": answer,
             "confidence": round(confidence, 3),

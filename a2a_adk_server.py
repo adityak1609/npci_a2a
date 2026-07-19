@@ -25,7 +25,7 @@ import os
 from dotenv import load_dotenv
 from google.adk.a2a.utils.agent_to_a2a import to_a2a
 
-from secrets_loader import load_secret_files
+from core.secrets_loader import load_secret_files
 
 logger = logging.getLogger(__name__)
 

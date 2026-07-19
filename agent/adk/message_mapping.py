@@ -37,7 +37,7 @@ from a2a.types import (
 )
 from google.genai import types as genai_types
 
-from a2a_models import A2AEnvelope, A2ATaskType
+from a2a_core.models import A2AEnvelope, A2ATaskType
 
 # Documents in a change_communication are carried as FileParts; this mime tags
 # them so the receiver treats the bytes as a document rather than inline text.

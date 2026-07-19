@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from embedding_config import (
+from rag.embedding_config import (
     DEFAULT_EMBEDDING_DIM,
     MAX_GEMINI_EMBEDDING_DIM,
     embedding_dim,

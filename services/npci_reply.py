@@ -14,7 +14,7 @@ import os
 from google import genai
 
 from database import AuditLog, DocumentChunk, NpciTicket, SessionLocal
-from ingest import generate_embeddings
+from rag.ingest import generate_embeddings
 from ws.manager import manager
 
 
@@ -60,7 +60,7 @@ async def handle_clarification_response_ingest(envelope, db_session) -> dict:
     - approver: who approved this clarification
     - generation_mode: "manual" | "ai_assisted" | "auto"
     """
-    from a2a_models import ClarificationResponsePayload
+    from a2a_core.models import ClarificationResponsePayload
 
     payload = envelope.payload
     try:
@@ -81,6 +81,23 @@ async def handle_clarification_response_ingest(envelope, db_session) -> dict:
         ticket = None
         if ticket_id:
             ticket = db.query(NpciTicket).filter(NpciTicket.ticket_id == ticket_id).first()
+
+        # Fallback correlation by query_id: the bank does not put its internal
+        # ticket_id on the outbound query wire (only query_id), so replies echo
+        # ticket_id=None. Without this, the reply lands as a detached CR- row and
+        # the original TKT- stays "pending" forever. query_id is the stable key
+        # the bank stored on the ticket, so match the original outbound ticket by
+        # it — excluding earlier detached reply rows.
+        if ticket is None and cr.query_id:
+            ticket = (
+                db.query(NpciTicket)
+                .filter(NpciTicket.query_id == cr.query_id)
+                .filter(NpciTicket.query != "NPCI clarification response")
+                .order_by(NpciTicket.created_at.asc())
+                .first()
+            )
+            if ticket:
+                ticket_id = ticket.ticket_id
 
         if ticket:
             ticket.answer = answer
@@ -203,7 +220,7 @@ async def _handle_authoritative_response(
 
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
-        raise EnvironmentError("GOOGLE_API_KEY not set.")
+        raise OSError("GOOGLE_API_KEY not set.")
 
     client = genai.Client(api_key=api_key)
     embeddings = await asyncio.to_thread(generate_embeddings, [answer], client)

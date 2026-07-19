@@ -4,12 +4,12 @@ from unittest.mock import patch
 import pytest
 from fastapi import HTTPException
 
-from auth import authenticate_user_for_role
+from security.auth import authenticate_user_for_role
 
 
 def test_standard_user_authentication_helper_accepts_standard_user():
     user = SimpleNamespace(is_admin=False)
-    with patch("auth.authenticate_user", return_value=user):
+    with patch("security.auth.authenticate_user", return_value=user):
         assert authenticate_user_for_role(
             None, "user@example.com", "secret", require_admin=False
         ) is user
@@ -17,7 +17,7 @@ def test_standard_user_authentication_helper_accepts_standard_user():
 
 def test_admin_login_accepts_admin():
     admin = SimpleNamespace(is_admin=True)
-    with patch("auth.authenticate_user", return_value=admin):
+    with patch("security.auth.authenticate_user", return_value=admin):
         assert authenticate_user_for_role(
             None, "admin@example.com", "secret", require_admin=True
         ) is admin
@@ -32,7 +32,7 @@ def test_admin_login_accepts_admin():
 )
 def test_role_mismatch_is_rejected(is_admin, require_admin, message):
     account = SimpleNamespace(is_admin=is_admin)
-    with patch("auth.authenticate_user", return_value=account):
+    with patch("security.auth.authenticate_user", return_value=account):
         with pytest.raises(HTTPException) as exc:
             authenticate_user_for_role(
                 None, "person@example.com", "secret", require_admin=require_admin
@@ -44,7 +44,7 @@ def test_role_mismatch_is_rejected(is_admin, require_admin, message):
 
 def test_admin_login_rejects_standard_user():
     user = SimpleNamespace(is_admin=False)
-    with patch("auth.authenticate_user", return_value=user):
+    with patch("security.auth.authenticate_user", return_value=user):
         with pytest.raises(HTTPException) as exc:
             authenticate_user_for_role(
                 None, "user@example.com", "secret", require_admin=True

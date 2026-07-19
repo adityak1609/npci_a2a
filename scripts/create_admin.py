@@ -25,12 +25,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from secrets_loader import load_secret_files  # noqa: E402
+from core.secrets_loader import load_secret_files  # noqa: E402
 
 load_secret_files()
 
-from auth import hash_password, validate_password_strength  # noqa: E402
 from database import AuditLog, SessionLocal, User  # noqa: E402
+from security.auth import hash_password, validate_password_strength  # noqa: E402
 
 
 def main() -> int:

@@ -1,6 +1,7 @@
 import uuid
-from locust import HttpUser, task, between
-import json
+
+from locust import HttpUser, between, task
+
 
 class PolicyBotUser(HttpUser):
     wait_time = between(1, 3)
@@ -8,7 +9,7 @@ class PolicyBotUser(HttpUser):
     def on_start(self):
         """On start, the user attempts to log in to get the auth cookie."""
         self.session_id = str(uuid.uuid4())
-        
+
         # We assume the environment is pre-seeded with this test admin
         response = self.client.post(
             "/auth/admin/login",

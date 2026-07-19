@@ -16,12 +16,14 @@ run it concurrently.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 from datetime import date, datetime, timezone
 
 from dotenv import load_dotenv
 
+from core.config import configure_logging
 from services.a2a_ingestor import (
     claim_next_queued_job,
     claim_next_received_change,
@@ -30,6 +32,8 @@ from services.a2a_ingestor import (
 )
 
 load_dotenv()
+configure_logging()
+logger = logging.getLogger(__name__)
 
 _stop = asyncio.Event()
 
@@ -79,13 +83,13 @@ async def _maybe_run_retention() -> None:
         return
     try:
         result = await asyncio.to_thread(_run_retention_locked)
-    except Exception as exc:
+    except Exception:
         # Leave _last_retention_date unset so the next loop iteration retries.
-        print(f"[worker] Retention run failed: {exc!r}")
+        logger.exception("Retention run failed")
         return
     _last_retention_date = now.date()
     if result is not None:
-        print(f"[worker] Daily retention complete: {result}")
+        logger.info("Daily retention complete: %s", result)
 
 
 def _install_signal_handlers() -> None:
@@ -99,13 +103,13 @@ def _install_signal_handlers() -> None:
 
 async def run_worker() -> None:
     _install_signal_handlers()
-    print("[worker] A2A ingestion worker started.")
+    logger.info("A2A ingestion worker started.")
     while not _stop.is_set():
         await _maybe_run_retention()
 
         change_id = await asyncio.to_thread(claim_next_received_change)
         if change_id is not None:
-            print(f"[worker] Claimed received change {change_id}.")
+            logger.info("Claimed received change %s.", change_id)
             await process_received_change(change_id)
             continue
 
@@ -113,14 +117,14 @@ async def run_worker() -> None:
         if job_id is None:
             try:
                 await asyncio.wait_for(_stop.wait(), timeout=_poll_interval())
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             continue
 
-        print(f"[worker] Claimed ingestion job {job_id}.")
+        logger.info("Claimed ingestion job %s.", job_id)
         await process_ingestion_job(job_id)
 
-    print("[worker] A2A ingestion worker stopped.")
+    logger.info("A2A ingestion worker stopped.")
 
 
 if __name__ == "__main__":

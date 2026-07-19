@@ -8,7 +8,7 @@ import os
 
 import pytest
 
-from guardrails import _check_regex, _classify_with_llm
+from security.guardrails import _check_regex, _classify_with_llm
 
 
 @pytest.mark.parametrize(

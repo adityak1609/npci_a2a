@@ -1,28 +1,28 @@
+"""Shared chat helpers: session history windowing, chat title generation, and
+the Gemini call-with-retry/fallback wrappers used by the chat routes."""
+
 import asyncio
-import os
-from typing import Optional
-from sqlalchemy.orm import Session
-from auth import User
-from database import ChatSession, ChatMessage
-from guardrails import sanitize_question
-from config import (
-    GEMINI_MODEL,
-    VERIFIED_STREAM_CHUNK_SIZE,
+import logging
+from datetime import timezone
+
+from agent.dispatcher import _get_genai_client
+from core.config import (
     CHAT_MEMORY_SIZE,
+    GEMINI_MODEL,
     MAX_RETRIES,
+    VERIFIED_STREAM_CHUNK_SIZE,
     gemini_models,
     is_retryable_llm_error,
 )
-import time
-from telemetry import _log_internal_error
-from metrics import time_request
-from metrics import observe_histogram
-from compliance import require_external_ai_approval
-import logging
+from core.metrics import observe_histogram, time_request
+from database import ChatMessage, ChatSession
+from security.auth import User
+from security.compliance import require_external_ai_approval
+from security.guardrails import sanitize_question
+
 logger = logging.getLogger(__name__)
+
 _RETRYABLE = ["429", "503", "500", "ReadTimeout"]
-from agent.dispatcher import _get_genai_client
-from datetime import timezone
 
 def _generate_content_once(contents: list, model: str = GEMINI_MODEL) -> str:
     response = _get_genai_client().models.generate_content(

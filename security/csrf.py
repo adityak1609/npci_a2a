@@ -1,4 +1,4 @@
-"""csrf.py — Origin/Referer-based CSRF protection for cookie-authenticated routes.
+"""security/csrf.py — Origin/Referer-based CSRF protection for cookie-authenticated routes.
 
 CSRF is a cookie-specific attack: a malicious third-party page tricks the
 browser into sending the victim's auth cookie to the server.

@@ -1,16 +1,17 @@
 """
 tests/test_mfa.py — Unit tests for the TOTP MFA flow.
 """
-import pytest
-import pyotp
 from unittest.mock import MagicMock, patch
 
-from auth import (
+import pyotp
+import pytest
+
+from security.auth import (
+    create_mfa_pending_token,
+    decode_mfa_pending_token,
     generate_totp_secret,
     get_totp_provisioning_uri,
     verify_totp,
-    create_mfa_pending_token,
-    decode_mfa_pending_token,
 )
 
 
@@ -67,7 +68,8 @@ class TestMfaPendingToken:
     def test_full_access_token_rejected_by_mfa_decoder(self):
         """A regular access token must not be accepted as an MFA token."""
         from fastapi import HTTPException
-        from auth import create_access_token
+
+        from security.auth import create_access_token
 
         with patch.dict("os.environ", {"SECRET_KEY": "x" * 64}):
             regular_token = create_access_token({"sub": "admin@example.com"})

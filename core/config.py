@@ -9,7 +9,6 @@ import os
 import sys
 from datetime import datetime, timezone
 
-
 request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
     "request_id",
     default="-",
@@ -49,18 +48,36 @@ class RequestIdFilter(logging.Filter):
         return True
 
 
+_logging_configured = False
+
+
 def configure_logging() -> None:
-    """Configure process-wide structured logging once."""
-    root = logging.getLogger()
-    if getattr(root, "_mindgate_logging_configured", False):
+    """Configure process-wide logging once.
+
+    LOG_FORMAT=json (default) — compact JSON lines for container log
+    collectors. LOG_FORMAT=text — human-readable lines for local debugging:
+
+        2026-07-13 14:02:11 WARNING rag.retriever [req-abc123] BM25 unavailable...
+
+    LOG_LEVEL (default INFO) controls the root level either way.
+    """
+    global _logging_configured
+    if _logging_configured:
         return
 
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(JsonFormatter())
+    if os.getenv("LOG_FORMAT", "json").strip().lower() == "text":
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(name)s [%(request_id)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+    else:
+        handler.setFormatter(JsonFormatter())
     handler.addFilter(RequestIdFilter())
+    root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
-    root._mindgate_logging_configured = True
+    _logging_configured = True
 
 
 # ---------------------------------------------------------------------------
